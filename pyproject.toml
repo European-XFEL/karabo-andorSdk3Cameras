@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=42", "setuptools-scm[toml]>=4.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+root = "."
+write_to = "src/andorSdk3Cameras/_version.py"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+AndorSdk3Cameras = ["data/*.*"]
+
+[project.entry-points."karabo.middlelayer_device"]
+AndorSdk3Cameras = "andorSdk3Cameras.AndorSdk3Cameras:AndorSdk3Cameras"
+
+[project]
+dynamic = ["version"]
+name = "AndorSdk3Cameras"
+authors = [
+    {name = "parenti"},
+]
+description = ""
+readme = "README.md"
+dependencies = [
+]
