@@ -1,5 +1,17 @@
 # AndorSdk3Cameras Device (MiddleLayer)
 
+## Setup
+
+The ``LD_LIBRARY_PATH`` environment variable  must be set so that the
+``pyAndorSDK3`` module can find the SDK provided libraries.
+
+This can be done e.g. by adding this line to the middle-layer server run
+script:
+
+
+``export LD_LIBRARY_PATH=$KARABO/lib:$KARABO/extern/lib``
+
+
 ## Testing
 
 Every Karabo device in Python is shipped as a regular python package.
