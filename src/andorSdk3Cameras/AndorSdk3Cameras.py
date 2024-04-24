@@ -12,15 +12,19 @@
 # Karabo itself is licensed under the terms of the MPL 2.0 license.
 #############################################################################
 
+from asyncio import CancelledError
 from time import time
 
+import numpy as np
 from pyAndorSDK3 import AndorSDK3, CameraException, ErrorCodes
 
 from imageSourcePy.CameraImageSourceMdl import CameraImageSource
 from karabo.middlelayer import (
-    AccessMode, Assignment, Double, EncodingType, Overwrite, Slot, State,
-    String, Timestamp, UInt8, UInt16, UInt32, UInt64, Unit, background, isSet,
-    sleep)
+    AccessMode, Assignment, Bool, Double, EncodingType, MetricPrefix,
+    Overwrite, Slot, State, String, Timestamp, UInt8, UInt16, UInt32, UInt64,
+    Unit, background, isSet, sleep)
+from processing_utils.moving_average import MovingAverage
+from processing_utils.rate_calculator import RateCalculator
 
 from ._version import version as deviceVersion
 
@@ -28,14 +32,14 @@ DATA_TYPE_MAP = {
     # Pixel Encoding: Karabo Type
     "Mono8": UInt8,
     "Mono12": UInt16,
-    # "Mono12Packed": Uint16,  # XXX not implemented yet
+    "Mono12Packed": UInt16,
     "Mono16": UInt16,
     "Mono32": UInt32}
 
 FEATURE_MAP = {
     # Karabo Key: Feature Name
     "cycleMode": "CycleMode",
-    # "frameCount": "FrameCount",  # XXX not writeable?
+    "frameCount": "FrameCount",
     "exposureTime": "ExposureTime",
     "frameRateTarget": "FrameRate",
     "aoiHBin": "AOIHBin",
@@ -44,9 +48,16 @@ FEATURE_MAP = {
     "aoiVBin": "AOIVBin",
     "aoiHeight": "AOIHeight",
     "aoiTop": "AOITop",
+    "pixelReadoutRate": "PixelReadoutRate",
     "pixelEncoding": "PixelEncoding",
     "bitDepth": "BitDepth",
-    "triggerMode": "TriggerMode"}
+    "bytesPerPixel": "BytesPerPixel",
+    "triggerMode": "TriggerMode",
+    "externalTriggerDelay": "ExternalTriggerDelay",
+    "electronicShutteringMode": "ElectronicShutteringMode",
+    "fanSpeed": "FanSpeed",
+    "sensorCooling": "SensorCooling",
+    "temperatureControl": "TemperatureControl"}
 
 
 class AndorSdk3Cameras(CameraImageSource):
@@ -69,6 +80,14 @@ class AndorSdk3Cameras(CameraImageSource):
         displayedName="Camera Model",
         accessMode=AccessMode.READONLY)
 
+    interfaceType = String(
+        displayedName="Interface Type",
+        accessMode=AccessMode.READONLY)
+
+    firmwareVersion = String(
+        displayedName="Firmware Version",
+        accessMode=AccessMode.READONLY)
+
     clockFrequency = UInt32(
         displayedName="Clock Frequency",
         description="The frequency of the camera internal clock.",
@@ -80,11 +99,6 @@ class AndorSdk3Cameras(CameraImageSource):
         description="The current value of the camera internal clock.",
         accessMode=AccessMode.READONLY)
 
-    sensorTemperature = Double(
-        displayedName="Sensor Temperature",
-        unitSymbol=Unit.DEGREE_CELSIUS,
-        accessMode=AccessMode.READONLY)
-
     @String(
         displayedName="Cycle Mode",
         description="Continuous: keep acquiring until acquisition is stopped. "
@@ -94,16 +108,21 @@ class AndorSdk3Cameras(CameraImageSource):
         allowedStates={State.UNKNOWN, State.ON})
     async def cycleMode(self, value):
         self.set_feature("cycleMode", value)
+        if value.value == "Fixed":
+            # Also apply 'frameCount'
+            self.set_feature("frameCount", self.frameCount)
 
     @UInt32(
         displayedName="Frame Count",
-        description="Number of frames to acquire when 'Fixed' cycle mode. "
-                    "Ignored in 'Continuous' mode.",
+        description="Number of frames to acquire when in 'Fixed' cycle mode.",
         minInc=1,
-        defaultValue=1,
         allowedStates={State.UNKNOWN, State.ON})
     async def frameCount(self, value):
-        self.set_feature("frameCount", value)
+        if self.cycleMode.value == "Fixed":
+            # Can only be set on the camera in "Fixed" cycle mode
+            self.set_feature("frameCount", value)
+        else:
+            self.frameCount = value
 
     @Double(
         displayedName="Exposure Time",
@@ -121,24 +140,49 @@ class AndorSdk3Cameras(CameraImageSource):
     async def frameRateTarget(self, value):
         self.set_feature("frameRateTarget", value)
 
+    frameRate = Double(
+        displayedName="Actual Frame Rate",
+        defaultValue=0.0,
+        unitSymbol=Unit.HERTZ,
+        accessMode=AccessMode.READONLY)
+
+    latency = Double(
+        displayedName="Image Latency",
+        defaultValue=0.0,
+        unitSymbol=Unit.SECOND,
+        accessMode=AccessMode.READONLY)
+
+    maxLatency = Double(
+        displayedName="Max Image Latency",
+        description="The acquisition will be aborted if the image latency "
+                    "exceeds this value, as it most probably means the "
+                    "device cannot cope with the frame rate.",
+        defaultValue=2.0,
+        unitSymbol=Unit.SECOND)
+
     @Slot(
         displayedName="Acquire",
         allowedStates={State.ON})
     async def acquire(self):
-
         self.acq_task = background(self.acquire_task)
 
         self.state = State.ACQUIRING
         self.status = "Acquisition Started"
 
     async def acquire_task(self):
+        img_size = self.camera.ImageSizeBytes
+        buffer_count = 5
+        for _ in range(0, buffer_count):
+            # Allocate buffers
+            buf = np.empty((img_size,), dtype='B')
+            self.camera.queue(buf, img_size)
+
+        self.camera.AcquisitionStart()
+
         while True:
             try:
-                img = self.camera.acquire(timeout=1000)  # timeout in ms
+                img = self.camera.wait_buffer(timeout=1000)  # timeout in ms
                 current_time = time()
-                # XXX needs:
-                # cd $KARABO/extern/lib
-                # ln -fs libatutility.so.3.15.30092.2 libatutility.so.3
                 data = img.image  # ndarray
                 camera_clock = img.metadata.timestamp  # "ticks" since power up
 
@@ -146,7 +190,7 @@ class AndorSdk3Cameras(CameraImageSource):
                 image_time = (
                     (camera_clock - self.timestampClock.value) /
                     self.clockFrequency.value + self.reference_time)
-                latency = current_time - image_time
+                latency, _ = self.image_latency(current_time - image_time)
                 ts = Timestamp(image_time)
                 self.logger.debug(
                     f"Received new image: shape: {data.shape} "
@@ -154,6 +198,22 @@ class AndorSdk3Cameras(CameraImageSource):
 
                 await self.write_channels(
                     data, encoding=EncodingType.GRAY, timestamp=ts)
+
+                # Reuse buffer
+                self.camera.queue(img._np_data, img_size)
+
+                self.frame_rate.update()
+
+                if latency > self.maxLatency.value:
+                    self.state = State.ERROR
+                    self.status = (
+                        f"Too high latency: {latency} s. The frame rate is "
+                        "possibly too high.")
+                    break
+
+            except CancelledError:
+                # Task has been canceled
+                break
 
             except CameraException as e:
                 if not self.camera.CameraAcquiring:
@@ -164,26 +224,34 @@ class AndorSdk3Cameras(CameraImageSource):
                     # e.g. waiting for external trigger
                     continue
                 else:
-                    self.status(f"Exception in acquire_task: {e}")
+                    self.status = f"Exception in acquire_task: {e}"
                     self.state = State.ERROR
                     break
 
             except Exception as e:
-                self.status(f"Exception in acquire_task: {e}")
+                self.status = f"Exception in acquire_task: {e}"
                 self.state = State.ERROR
                 break
 
             finally:
                 await sleep(0.01)
 
+        self.camera.AcquisitionStop()
         self.camera.flush()
 
     @Slot(
         displayedName="Stop",
         allowedStates=[State.ACQUIRING])
     async def stop(self):
+        self.state = State.STOPPING
+        self.camera.AcquisitionStop()
+
         if self.acq_task:
             self.acq_task.cancel()
+            try:
+                await self.acq_task
+            except (Exception, CancelledError):
+                pass
             self.acq_task = None
 
         self.state = State.ON
@@ -266,8 +334,14 @@ class AndorSdk3Cameras(CameraImageSource):
         self.set_feature("aoiTop", value)
 
     @String(
+        displayedName="Pixel Readout Rate",
+        allowedStates={State.UNKNOWN, State.ON})
+    async def pixelReadoutRate(self, value):
+        self.set_feature("pixelReadoutRate", value)
+
+    @String(
         displayedName="Pixel Encoding",
-        defaultValue="Mono16",
+        defaultValue="Mono12Packed",
         allowedStates={State.UNKNOWN, State.ON})
     async def pixelEncoding(self, value):
         if value.value not in DATA_TYPE_MAP:
@@ -276,10 +350,27 @@ class AndorSdk3Cameras(CameraImageSource):
         self.set_feature("pixelEncoding", value)
         if self.camera:
             self.bitDepth = self.camera.BitDepth
+            self.bytesPerPixel = self.camera.BytesPerPixel
             await self.update_output_schema_andor()
 
     bitDepth = String(
         displayedName="Bit Depth",
+        accessMode=AccessMode.READONLY)
+
+    bytesPerPixel = Double(
+        displayedName="Bytes-per-Pixel",
+        accessMode=AccessMode.READONLY)
+
+    pixelHeight = Double(
+        displayedName="Pixel Height",
+        unitSymbol=Unit.METER,
+        metricPrefixSymbol=MetricPrefix.MICRO,
+        accessMode=AccessMode.READONLY)
+
+    pixelWidth = Double(
+        displayedName="Pixel Width",
+        unitSymbol=Unit.METER,
+        metricPrefixSymbol=MetricPrefix.MICRO,
         accessMode=AccessMode.READONLY)
 
     @String(
@@ -289,13 +380,60 @@ class AndorSdk3Cameras(CameraImageSource):
     async def triggerMode(self, value):
         self.set_feature("triggerMode", value)
 
-    # XXX more properties, e.g.
-    # FanSpeed: Enumerated
-    # PixelReadoutRate: Enumerated
-    # SensorCooling: Bool
+    @Double(
+        displayedName="Ext. Trigger Delay",
+        unitSymbol=Unit.SECOND,
+        allowedStates={State.UNKNOWN, State.ON})
+    async def externalTriggerDelay(self, value):
+        self.set_feature("externalTriggerDelay", value)
+
+    @String(
+        displayedName="Electronic Shutter Mode",
+        defaultValue="Rolling",
+        allowedStates={State.UNKNOWN, State.ON})
+    async def electronicShutteringMode(self, value):
+        self.set_feature("electronicShutteringMode", value)
+
+    @String(
+        displayedName="Fan Speed",
+        allowedStates={State.UNKNOWN, State.ON})
+    async def fanSpeed(self, value):
+        self.set_feature("fanSpeed", value)
+
+    @Bool(
+        displayedName="Sensor Cooling",
+        allowedStates={State.UNKNOWN, State.ON})
+    async def sensorCooling(self, value):
+        self.set_feature("sensorCooling", value)
+
+    @String(
+        displayedName="Temperature Control",
+        unitSymbol=Unit.DEGREE_CELSIUS,
+        allowedStates={State.UNKNOWN, State.ON})
+    async def temperatureControl(self, value):
+        self.set_feature("temperatureControl", value)
+        if self.camera:
+            self.targetSensorTemperature = self.camera.TargetSensorTemperature
+
+    targetSensorTemperature = Double(
+        displayedName="Target Sensor Temperature",
+        unitSymbol=Unit.DEGREE_CELSIUS,
+        accessMode=AccessMode.READONLY)
+
+    sensorTemperature = Double(
+        displayedName="Sensor Temperature",
+        unitSymbol=Unit.DEGREE_CELSIUS,
+        accessMode=AccessMode.READONLY)
+
+    temperatureStatus = String(
+        displayedName="Temperature Status",
+        accessMode=AccessMode.READONLY)
 
     def __init__(self, configuration):
         super().__init__(configuration)
+        self.frame_rate = RateCalculator(refresh_interval=1.0)
+        self.image_latency = MovingAverage(window_size=10)
+        self.frame_rate_task = background(self.refresh_frame_rate())
         self.acq_task = None
         self.poll_task = background(self.poll_camera())
 
@@ -321,7 +459,9 @@ class AndorSdk3Cameras(CameraImageSource):
         if self.camera:
             self.status = f"Connected to {self.serialNumber}"
         else:
-            self.status = f"No camera found with SN {self.serialNumber}"
+            self.status = (
+                f"No camera found with SN={self.serialNumber}. "
+                "It could be OFF or controlled by another application.")
             self.state = State.UNKNOWN
             return
 
@@ -348,7 +488,11 @@ class AndorSdk3Cameras(CameraImageSource):
         self.camera.MetadataEnable = True
 
         self.cameraModel = self.camera.CameraModel
+        self.interfaceType = self.camera.InterfaceType
+        self.firmwareVersion = self.camera.FirmwareVersion
         self.clockFrequency = self.camera.TimestampClockFrequency
+        self.pixelHeight = self.camera.PixelHeight
+        self.pixelWidth = self.camera.PixelWidth
 
         await self.update_output_schema_andor()
 
@@ -402,13 +546,30 @@ class AndorSdk3Cameras(CameraImageSource):
                 self.reference_time = time()
 
                 self.sensorTemperature = self.camera.SensorTemperature
+                self.temperatureStatus = self.camera.TemperatureStatus
+
                 await sleep(5)
             else:
                 await sleep(1)
 
+    async def refresh_frame_rate(self):
+        while True:
+            fps = self.frame_rate.refresh()
+            if self.state == State.ACQUIRING:
+                if fps:
+                    self.frameRate = fps
+                self.latency = self.image_latency.avg
+            else:
+                if self.frameRate:
+                    self.frameRate = 0.0
+                if self.latency:
+                    self.latency = 0.0
+
+            await sleep(1)
+
     async def onDestruction(self):
-        if self.poll_task:
-            self.poll_task.cancel()
+        self.poll_task.cancel()
+        self.frame_rate_task.cancel()
         if self.acq_task:
             self.acq_task.cancel()
         if self.camera:
