@@ -18,8 +18,9 @@ from pyAndorSDK3 import AndorSDK3, CameraException, ErrorCodes
 
 from imageSourcePy.CameraImageSourceMdl import CameraImageSource
 from karabo.middlelayer import (
-    AccessMode, Assignment, Double, EncodingType, Slot, State, String,
-    Timestamp, UInt8, UInt16, UInt32, UInt64, Unit, background, isSet, sleep)
+    AccessMode, Assignment, Double, EncodingType, Overwrite, Slot, State,
+    String, Timestamp, UInt8, UInt16, UInt32, UInt64, Unit, background, isSet,
+    sleep)
 
 from ._version import version as deviceVersion
 
@@ -89,8 +90,6 @@ class AndorSdk3Cameras(CameraImageSource):
         description="Continuous: keep acquiring until acquisition is stopped. "
                     "Fixed: the camera acquires 'Frame Count' images and "
                     "stops automatically.",
-        options={"Continuous", "Fixed"},
-        # XXX read and inject options with self.camera.options_EnumFeatureName
         defaultValue="Continuous",
         allowedStates={State.UNKNOWN, State.ON})
     async def cycleMode(self, value):
@@ -109,8 +108,6 @@ class AndorSdk3Cameras(CameraImageSource):
     @Double(
         displayedName="Exposure Time",
         minInc=0.0,
-        # XXX read and inject min/max with self.camera.min_FeatureName and
-        #     self.camera_max_FeatureName
         unitSymbol=Unit.SECOND,
         allowedStates={State.UNKNOWN, State.ON})
     async def exposureTime(self, value):
@@ -210,6 +207,7 @@ class AndorSdk3Cameras(CameraImageSource):
     async def aoiHBin(self, value):
         self.set_feature("aoiHBin", value)
         if self.camera:
+            # XXX also update_schema_andor() might be required
             await self.update_output_schema_andor()
 
     @UInt32(
@@ -220,6 +218,7 @@ class AndorSdk3Cameras(CameraImageSource):
     async def aoiWitdh(self, value):
         self.set_feature("aoiWitdh", value)
         if self.camera:
+            # XXX also update_schema_andor() might be required
             await self.update_output_schema_andor()
 
     @UInt32(
@@ -242,6 +241,7 @@ class AndorSdk3Cameras(CameraImageSource):
     async def aoiVBin(self, value):
         self.set_feature("aoiVBin", value)
         if self.camera:
+            # XXX also update_schema_andor() might be required
             await self.update_output_schema_andor()
 
     @UInt32(
@@ -252,6 +252,7 @@ class AndorSdk3Cameras(CameraImageSource):
     async def aoiHeight(self, value):
         self.set_feature("aoiHeight", value)
         if self.camera:
+            # XXX also update_schema_andor() might be required
             await self.update_output_schema_andor()
 
     @UInt32(
@@ -266,11 +267,12 @@ class AndorSdk3Cameras(CameraImageSource):
 
     @String(
         displayedName="Pixel Encoding",
-        # XXX read and inject options with self.camera.options_EnumFeatureName
-        options=list(DATA_TYPE_MAP),
         defaultValue="Mono16",
         allowedStates={State.UNKNOWN, State.ON})
     async def pixelEncoding(self, value):
+        if value.value not in DATA_TYPE_MAP:
+            raise NotImplementedError(f"{value.value} is not yet supported")
+
         self.set_feature("pixelEncoding", value)
         if self.camera:
             self.bitDepth = self.camera.BitDepth
@@ -283,7 +285,6 @@ class AndorSdk3Cameras(CameraImageSource):
     @String(
         displayedName="Trigger Mode",
         defaultValue="Internal",
-        options={"Internal", "External"},
         allowedStates={State.UNKNOWN, State.ON})
     async def triggerMode(self, value):
         self.set_feature("triggerMode", value)
@@ -351,6 +352,8 @@ class AndorSdk3Cameras(CameraImageSource):
 
         await self.update_output_schema_andor()
 
+        await self.update_schema_andor()
+
         if self.state != State.ERROR:
             self.state = State.ON
 
@@ -364,6 +367,33 @@ class AndorSdk3Cameras(CameraImageSource):
         self.logger.debug(
             f"Update output schema: shape={shape} dtype={dtype}")
         await self.update_output_schema(shape, EncodingType.GRAY, dtype)
+
+    async def update_schema_andor(self):
+        new_dict = {}
+        for key, feature in FEATURE_MAP.items():
+            feature_type = getattr(self.camera, f"type_{feature}")
+            if feature_type == "enumerated_string":
+                options = getattr(self.camera, f"options_{feature}")
+                # XXX Also change defaultValue if not in options
+                setattr(self.__class__, key, Overwrite(options=options))
+                value = getattr(self, key)
+                if isSet(value) and value.value not in options:
+                    new_dict[key] = options[0]
+
+            elif feature_type in ("float", "int"):
+                min_value = getattr(self.camera, f"min_{feature}")
+                max_value = getattr(self.camera, f"max_{feature}")
+                # Also change defaultVale if not within range
+                setattr(self.__class__, key, Overwrite(
+                    minInc=min_value, maxInc=max_value))
+                value = getattr(self, key)
+                if isSet(value):
+                    if value.value < min_value:
+                        new_dict[key] = min_value
+                    elif value.value > max_value:
+                        new_dict[key] = max_value
+
+        await self.publishInjectedParameters(**new_dict)
 
     async def poll_camera(self):
         while True:

@@ -13,13 +13,14 @@
 #############################################################################
 import pytest
 
+from karabo.middlelayer import State
 from karabo.middlelayer.testing import AsyncDeviceContext, event_loop
 
 from ..AndorSdk3Cameras import AndorSdk3Cameras
 
 _DEVICE_CONFIG = {
     "_deviceId_": "TestAndorSdk3Cameras",
-    "greeting": "buongiorno"
+    "serialNumber": "S01234"
 }
 
 
@@ -29,8 +30,4 @@ async def test_greeting(event_loop: event_loop):
     device = AndorSdk3Cameras(_DEVICE_CONFIG)
     async with AsyncDeviceContext(device=device) as ctx:
         assert ctx.instances["device"] is device
-        for greet in ("Buongiorno", "Guten Tag", "Moin Moin"):
-            device.greeting = greet
-            assert device.greeting.value == greet
-            await device.hello()
-            assert device.greeting.value == "Hello world!"
+        assert device.state in (State.INIT, State.UNKNOWN)
