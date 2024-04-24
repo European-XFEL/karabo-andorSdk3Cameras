@@ -1,3 +1,4 @@
 #package, tag
-andorSdk3, 3.15.30092.2
+andorSdk3, 3.15.30092.2p1
 imageSourcePy, 1.4.0
+processingUtils, 1.4.2
