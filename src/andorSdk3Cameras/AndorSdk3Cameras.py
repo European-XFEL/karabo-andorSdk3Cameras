@@ -540,13 +540,28 @@ class AndorSdk3Cameras(CameraImageSource):
         await self.publishInjectedParameters(**new_dict)
 
     async def poll_camera(self):
+        error_count = 0
+
         while True:
             if self.camera:
-                self.timestampClock = self.camera.TimestampClock
-                self.reference_time = time()
+                try:
+                    self.timestampClock = self.camera.TimestampClock
+                    self.reference_time = time()
 
-                self.sensorTemperature = self.camera.SensorTemperature
-                self.temperatureStatus = self.camera.TemperatureStatus
+                    self.sensorTemperature = self.camera.SensorTemperature
+                    self.temperatureStatus = self.camera.TemperatureStatus
+
+                    error_count = 0
+
+                except CameraException as e:
+                    error_count += 1
+                    if error_count < 10:
+                        self.logger.error(f"Exception in poll_camera: {e}")
+                    else:
+                        # Assume the connection is lost after 10 consecutive
+                        # communication errors
+                        self.status = "Lost connection to the camera"
+                        self.state = State.UNKNOWN
 
                 await sleep(5)
             else:
