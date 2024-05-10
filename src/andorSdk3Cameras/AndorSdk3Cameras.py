@@ -59,6 +59,9 @@ FEATURE_MAP = {
     "sensorCooling": "SensorCooling",
     "temperatureControl": "TemperatureControl"}
 
+# Sleep time between two connect attempts
+SLEEP_TIME = 5
+
 
 class AndorSdk3Cameras(CameraImageSource):
     __version__ = deviceVersion
@@ -236,7 +239,8 @@ class AndorSdk3Cameras(CameraImageSource):
             finally:
                 await sleep(0.01)
 
-        self.camera.AcquisitionStop()
+        if self.camera.CameraAcquiring:
+            self.camera.AcquisitionStop()
         self.camera.flush()
 
     @Slot(
@@ -435,35 +439,58 @@ class AndorSdk3Cameras(CameraImageSource):
         self.image_latency = MovingAverage(window_size=10)
         self.frame_rate_task = background(self.refresh_frame_rate())
         self.acq_task = None
-        self.poll_task = background(self.poll_camera())
+        self.poll_task = None
+
+    def connect(self, sdk3):
+        """ This method will be called when the device starts.
+
+            Define your actions to be executed after instantiation.
+        """
+        self.logger.debug(f"connect: Found {sdk3.DeviceCount} cameras")
+        for idx in range(sdk3.DeviceCount):
+            try:
+                cam = sdk3.GetCamera(idx)
+                self.logger.debug(f"connect: Found camera {cam.SerialNumber}")
+                if cam.SerialNumber == self.serialNumber:
+                    return cam
+            except Exception as e:
+                # Simulated cameras will raise AT_ERR_NOTIMPLEMENTED
+                # Cameras already in use will throw AT_ERR_DEVICEINUSE
+                self.logger.debug(f"connect: idx={idx} e={e}")
+                continue
 
     async def onInitialization(self):
         """ This method will be called when the device starts.
 
             Define your actions to be executed after instantiation.
         """
-        self.state = State.INIT
+        no_camera_msg = (
+            f"No camera found with SN={self.serialNumber}. "
+            "It could be OFF or controlled by another application. "
+            f"Trying to reconnect in {SLEEP_TIME} s.")
+        connected_msg = f"Connected to {self.serialNumber}"
 
         sdk3 = AndorSDK3()
-        for idx in range(sdk3.DeviceCount):
-            try:
-                cam = sdk3.GetCamera(idx)
-                if cam.SerialNumber == self.serialNumber:
-                    self.camera = cam
-                    break
-            except Exception:
-                # Simulated cameras will raise AT_ERR_NOTIMPLEMENTED
-                # Cameras already in use will throw AT_ERR_DEVICEINUSE
-                continue
+        while True:
+            cam = self.connect(sdk3)
+            if cam:
+                break
 
-        if self.camera:
-            self.status = f"Connected to {self.serialNumber}"
-        else:
-            self.status = (
-                f"No camera found with SN={self.serialNumber}. "
-                "It could be OFF or controlled by another application.")
-            self.state = State.UNKNOWN
-            return
+            if self.status != no_camera_msg:
+                self.status = no_camera_msg
+                self.logger.error(no_camera_msg)
+            await sleep(SLEEP_TIME)
+            # XXX Reinitialize() only works properly if the camera is connected
+            # after the device is instantiated.
+            # It does not if the camera is disconnected and reconnected.
+            # In this case I have to even restart the MDL server to be able to
+            # connect again to the camera.
+            sdk3.Reinitialise()
+
+        self.camera = cam
+        self.status = connected_msg
+        self.logger.info(connected_msg)
+        self.state = State.INIT
 
         for key, feature in FEATURE_MAP.items():
             value = getattr(self, key, None)
@@ -497,6 +524,9 @@ class AndorSdk3Cameras(CameraImageSource):
         await self.update_output_schema_andor()
 
         await self.update_schema_andor()
+
+        # Start polling
+        self.poll_task = background(self.poll_camera())
 
         if self.state != State.ERROR:
             self.state = State.ON
@@ -543,29 +573,28 @@ class AndorSdk3Cameras(CameraImageSource):
         error_count = 0
 
         while True:
-            if self.camera:
-                try:
-                    self.timestampClock = self.camera.TimestampClock
-                    self.reference_time = time()
+            try:
+                self.timestampClock = self.camera.TimestampClock
+                self.reference_time = time()
 
-                    self.sensorTemperature = self.camera.SensorTemperature
-                    self.temperatureStatus = self.camera.TemperatureStatus
+                self.sensorTemperature = self.camera.SensorTemperature
+                self.temperatureStatus = self.camera.TemperatureStatus
 
-                    error_count = 0
+                error_count = 0
 
-                except CameraException as e:
-                    error_count += 1
-                    if error_count < 10:
-                        self.logger.error(f"Exception in poll_camera: {e}")
-                    else:
-                        # Assume the connection is lost after 10 consecutive
-                        # communication errors
-                        self.status = "Lost connection to the camera"
-                        self.state = State.UNKNOWN
+            except CameraException as e:
+                error_count += 1
+                if error_count < 10:
+                    self.logger.error(f"Exception in poll_camera: {e}")
+                else:
+                    # Assume the connection is lost after 10 consecutive
+                    # communication errors
+                    self.status = "Lost connection to the camera"
+                    self.state = State.UNKNOWN
+                    self.poll_task = None
+                    return
 
-                await sleep(5)
-            else:
-                await sleep(1)
+            await sleep(5)
 
     async def refresh_frame_rate(self):
         while True:
@@ -583,10 +612,12 @@ class AndorSdk3Cameras(CameraImageSource):
             await sleep(1)
 
     async def onDestruction(self):
-        self.poll_task.cancel()
+        if self.poll_task:
+            self.poll_task.cancel()
         self.frame_rate_task.cancel()
         if self.acq_task:
             self.acq_task.cancel()
         if self.camera:
-            self.camera.AcquisitionStop()
+            if self.camera.CameraAcquiring:
+                self.camera.AcquisitionStop()
             self.camera.flush()
