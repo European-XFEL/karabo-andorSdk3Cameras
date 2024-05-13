@@ -63,7 +63,7 @@ FEATURE_MAP = {
 RECONNECT_TIME = 5
 
 
-class AndorSdk3Cameras(CameraImageSource):
+class AndorSdk3Camera(CameraImageSource):
     __version__ = deviceVersion
 
     camera = None

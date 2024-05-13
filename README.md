@@ -1,4 +1,4 @@
-# AndorSdk3Cameras Device (MiddleLayer)
+# AndorSdk3Camera Device (MiddleLayer)
 
 ## Setup
 
@@ -31,7 +31,7 @@ utility script:
 
 If you want to manually start a server using this device, simply type:
 
-``karabo-middlelayerserver serverId=middleLayerServer/1 deviceClasses=AndorSdk3Cameras``
+``karabo-middlelayerserver serverId=middleLayerServer/1 deviceClasses=AndorSdk3Camera``
 
 Or just use (a properly configured):
 

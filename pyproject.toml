@@ -13,7 +13,7 @@ where = ["src"]
 AndorSdk3Cameras = ["data/*.*"]
 
 [project.entry-points."karabo.middlelayer_device"]
-AndorSdk3Cameras = "andorSdk3Cameras.AndorSdk3Cameras:AndorSdk3Cameras"
+AndorSdk3Camera = "andorSdk3Cameras.AndorSdk3Camera:AndorSdk3Camera"
 
 [project]
 dynamic = ["version"]

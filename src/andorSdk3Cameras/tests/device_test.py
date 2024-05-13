@@ -16,10 +16,10 @@ import pytest
 from karabo.middlelayer import State
 from karabo.middlelayer.testing import AsyncDeviceContext, event_loop
 
-from ..AndorSdk3Cameras import AndorSdk3Cameras
+from ..AndorSdk3Camera import AndorSdk3Camera
 
 _DEVICE_CONFIG = {
-    "_deviceId_": "TestAndorSdk3Cameras",
+    "_deviceId_": "TestAndorSdk3Camera",
     "serialNumber": "S01234"
 }
 
@@ -27,7 +27,7 @@ _DEVICE_CONFIG = {
 @pytest.mark.timeout(30)
 @pytest.mark.asyncio
 async def test_greeting(event_loop: event_loop):
-    device = AndorSdk3Cameras(_DEVICE_CONFIG)
+    device = AndorSdk3Camera(_DEVICE_CONFIG)
     async with AsyncDeviceContext(device=device) as ctx:
         assert ctx.instances["device"] is device
         assert device.state == State.UNKNOWN
