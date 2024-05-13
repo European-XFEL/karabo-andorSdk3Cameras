@@ -60,7 +60,7 @@ FEATURE_MAP = {
     "temperatureControl": "TemperatureControl"}
 
 # Sleep time between two connect attempts
-SLEEP_TIME = 5
+RECONNECT_TIME = 5
 
 
 class AndorSdk3Cameras(CameraImageSource):
@@ -173,6 +173,11 @@ class AndorSdk3Cameras(CameraImageSource):
         self.status = "Acquisition Started"
 
     async def acquire_task(self):
+        self.image_latency.window.clear()
+
+        # Synchronize camera internal clock and Karabo time
+        self.synchronize_camera()
+
         img_size = self.camera.ImageSizeBytes
         buffer_count = 5
         for _ in range(0, buffer_count):
@@ -439,13 +444,15 @@ class AndorSdk3Cameras(CameraImageSource):
         self.image_latency = MovingAverage(window_size=10)
         self.frame_rate_task = background(self.refresh_frame_rate())
         self.acq_task = None
-        self.poll_task = None
+        self.connect_or_poll_task = None
 
     def connect(self, sdk3):
-        """ This method will be called when the device starts.
+        """Try to connect (for the first time) to the camera"""
+        if self.camera:
+            raise RuntimeError(
+                "This function can only be called to connect to the camera "
+                "the first time.")
 
-            Define your actions to be executed after instantiation.
-        """
         self.logger.debug(f"connect: Found {sdk3.DeviceCount} cameras")
         for idx in range(sdk3.DeviceCount):
             try:
@@ -459,15 +466,44 @@ class AndorSdk3Cameras(CameraImageSource):
                 self.logger.debug(f"connect: idx={idx} e={e}")
                 continue
 
-    async def onInitialization(self):
-        """ This method will be called when the device starts.
+    async def reconnect(self):
+        """Try to reconnect to the camera after a connection loss"""
+        reconnect_fail_msg = (
+            f"Could not reconnect to {self.serialNumber}. "
+            f"Trying again in {RECONNECT_TIME} s.")
+        connected_msg = f"Reconnected to {self.serialNumber}"
 
-            Define your actions to be executed after instantiation.
-        """
+        if not self.camera:
+            raise RuntimeError(
+                "This function can only be called to re-connect to the camera "
+                "after the connection has been lost.")
+
+        if self.camera.handle:
+            self.camera.close()  # Closes the camera instance
+
+        while True:
+            try:
+                self.camera.open()  # Re-opens the camera instance
+                break
+            except Exception:
+                # The camera is not available yet
+                if self.status != reconnect_fail_msg:
+                    self.status = reconnect_fail_msg
+                    self.logger.error(reconnect_fail_msg)
+                await sleep(RECONNECT_TIME)
+
+        self.status = connected_msg
+        self.logger.info(connected_msg)
+        self.state = State.INIT
+
+        await self.initialize_camera()
+
+    async def onInitialization(self):
+        """This method will be called when the device starts."""
         no_camera_msg = (
             f"No camera found with SN={self.serialNumber}. "
             "It could be OFF or controlled by another application. "
-            f"Trying to reconnect in {SLEEP_TIME} s.")
+            f"Trying to reconnect in {RECONNECT_TIME} s.")
         connected_msg = f"Connected to {self.serialNumber}"
 
         sdk3 = AndorSDK3()
@@ -479,12 +515,10 @@ class AndorSdk3Cameras(CameraImageSource):
             if self.status != no_camera_msg:
                 self.status = no_camera_msg
                 self.logger.error(no_camera_msg)
-            await sleep(SLEEP_TIME)
-            # XXX Reinitialize() only works properly if the camera is connected
-            # after the device is instantiated.
-            # It does not if the camera is disconnected and reconnected.
-            # In this case I have to even restart the MDL server to be able to
-            # connect again to the camera.
+            await sleep(RECONNECT_TIME)
+            # Reinitialize the library in order to re-discover cameras
+            # NB This will block forever if called again after a camera
+            # has been already discovered!
             sdk3.Reinitialise()
 
         self.camera = cam
@@ -492,7 +526,20 @@ class AndorSdk3Cameras(CameraImageSource):
         self.logger.info(connected_msg)
         self.state = State.INIT
 
+        await self.initialize_camera()
+
+    async def initialize_camera(self):
+        """This function does the initial setup of the camera"""
+        schema_hash = self.getDeviceSchema().hash
+
         for key, feature in FEATURE_MAP.items():
+            access_mode = schema_hash.getAttribute(key, "accessMode")
+            if access_mode not in (
+                    AccessMode.INITONLY.value,
+                    AccessMode.RECONFIGURABLE.value):
+                # The parameter is read-only
+                continue
+
             value = getattr(self, key, None)
             if isSet(value):
                 # Set values to the camera
@@ -526,7 +573,7 @@ class AndorSdk3Cameras(CameraImageSource):
         await self.update_schema_andor()
 
         # Start polling
-        self.poll_task = background(self.poll_camera())
+        self.connect_or_poll_task = background(self.poll_camera())
 
         if self.state != State.ERROR:
             self.state = State.ON
@@ -569,13 +616,18 @@ class AndorSdk3Cameras(CameraImageSource):
 
         await self.publishInjectedParameters(**new_dict)
 
+    def synchronize_camera(self):
+        """Synchronize camera internal clock and Karabo time"""
+        self.timestampClock = self.camera.TimestampClock
+        self.reference_time = time()
+
     async def poll_camera(self):
         error_count = 0
 
         while True:
             try:
-                self.timestampClock = self.camera.TimestampClock
-                self.reference_time = time()
+                # Synchronize camera internal clock and Karabo time
+                self.synchronize_camera()
 
                 self.sensorTemperature = self.camera.SensorTemperature
                 self.temperatureStatus = self.camera.TemperatureStatus
@@ -589,9 +641,12 @@ class AndorSdk3Cameras(CameraImageSource):
                 else:
                     # Assume the connection is lost after 10 consecutive
                     # communication errors
+
                     self.status = "Lost connection to the camera"
+                    self.logger.error("Lost connection to the camera")
                     self.state = State.UNKNOWN
-                    self.poll_task = None
+                    await sleep(1)
+                    self.connect_or_poll_task = background(self.reconnect())
                     return
 
             await sleep(5)
@@ -612,8 +667,8 @@ class AndorSdk3Cameras(CameraImageSource):
             await sleep(1)
 
     async def onDestruction(self):
-        if self.poll_task:
-            self.poll_task.cancel()
+        if self.connect_or_poll_task:
+            self.connect_or_poll_task.cancel()
         self.frame_rate_task.cancel()
         if self.acq_task:
             self.acq_task.cancel()
