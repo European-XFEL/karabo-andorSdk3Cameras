@@ -641,15 +641,27 @@ class AndorSdk3Cameras(CameraImageSource):
                 else:
                     # Assume the connection is lost after 10 consecutive
                     # communication errors
-
-                    self.status = "Lost connection to the camera"
-                    self.logger.error("Lost connection to the camera")
-                    self.state = State.UNKNOWN
-                    await sleep(1)
-                    self.connect_or_poll_task = background(self.reconnect())
+                    await self.disconnection_handler()
                     return
 
             await sleep(5)
+
+    async def disconnection_handler(self):
+        status = "Lost connection to the camera"
+        self.logger.error(status)
+        self.status = status
+        await sleep(1)
+
+        if self.acq_task:
+            self.acq_task.cancel()
+            self.acq_task = None
+
+        if self.connect_or_poll_task:
+            self.connect_or_poll_task.cancel()
+
+        self.state = State.UNKNOWN
+
+        self.connect_or_poll_task = background(self.reconnect())
 
     async def refresh_frame_rate(self):
         while True:

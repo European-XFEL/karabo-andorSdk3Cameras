@@ -30,4 +30,4 @@ async def test_greeting(event_loop: event_loop):
     device = AndorSdk3Cameras(_DEVICE_CONFIG)
     async with AsyncDeviceContext(device=device) as ctx:
         assert ctx.instances["device"] is device
-        assert device.state in (State.INIT, State.UNKNOWN)
+        assert device.state == State.UNKNOWN
