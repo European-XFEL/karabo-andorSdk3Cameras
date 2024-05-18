@@ -22,7 +22,7 @@ from imageSourcePy.CameraImageSourceMdl import CameraImageSource
 from karabo.middlelayer import (
     AccessMode, Assignment, Bool, Double, EncodingType, MetricPrefix,
     Overwrite, Slot, State, String, Timestamp, UInt8, UInt16, UInt32, UInt64,
-    Unit, background, isSet, sleep)
+    Unit, background, coslot, isSet, sleep)
 from processing_utils.moving_average import MovingAverage
 from processing_utils.rate_calculator import RateCalculator
 
@@ -43,7 +43,7 @@ FEATURE_MAP = {
     "exposureTime": "ExposureTime",
     "frameRateTarget": "FrameRate",
     "aoiHBin": "AOIHBin",
-    "aoiWitdh": "AOIWidth",
+    "aoiWidth": "AOIWidth",
     "aoiLeft": "AOILeft",
     "aoiVBin": "AOIVBin",
     "aoiHeight": "AOIHeight",
@@ -59,6 +59,25 @@ FEATURE_MAP = {
     "sensorCooling": "SensorCooling",
     "temperatureControl": "TemperatureControl"}
 
+# Updating a camera feature can affect the value or options of another one.
+# Here is a dictionary of known relations.
+RELATED_PROPERTIES = {
+    # Karabo <key>: Properties potentially affected by a change in <key>
+    "exposureTime": ("frameRateTarget",),
+    "pixelReadoutRate": ("frameRateTarget", ),
+    "pixelEncoding": ("bitDepth", "bytesPerPixel", ),
+    "aoiHBin": ("aoiWidth", ),
+    "aoiWidth": ("aoiLeft", ),
+    "aoiLeft": ("aoiWidth", ),
+    "aoiVBin": ("aoiHeight", ),
+    "aoiHeight": ("aoiTop", ),
+    "aoiTop": ("aoiHeight", )}
+
+# Updating some camera features will affect e.g. the image shape or data type,
+# thus a schema update for the output channel will be needed.
+SCHEMA_CHANGING_PROPERTIES = {
+    "aoiHBin", "aoiWidth", "aoiVBin", "aoiHeight", "pixelEncoding"}
+
 # Sleep time between two connect attempts
 RECONNECT_TIME = 5
 
@@ -68,11 +87,28 @@ class AndorSdk3Camera(CameraImageSource):
 
     camera = None
 
+    def sync_feature(self, key):
+        """Synchronizes the property in the Karabo device with the current
+        value on the camera."""
+        if not self.camera:
+            return
+
+        feature = FEATURE_MAP[key]
+        value = getattr(self.camera, feature)
+        if getattr(self, key).value != value:
+            self.logger.debug(
+                f"Feature {feature} changed. Updating to {value}")
+            setattr(self, key, value)
+
     def set_feature(self, key, value):
-        if self.camera and isSet(value):
-            self.logger.debug(f"Setting {FEATURE_MAP[key]} = {value.value}")
-            setattr(self.camera, FEATURE_MAP[key], value.value)
-        setattr(self, key, value)
+        new_value = value.value
+        if self.camera:
+            feature = FEATURE_MAP[key]
+            current_value = getattr(self.camera, feature)
+            if isSet(new_value) and current_value != new_value:
+                self.logger.debug(f"Setting {feature} to {new_value}")
+                setattr(self.camera, feature, new_value)
+        setattr(self, key, new_value)
 
     serialNumber = String(
         displayedName="Serial Number",
@@ -112,7 +148,7 @@ class AndorSdk3Camera(CameraImageSource):
     async def cycleMode(self, value):
         self.set_feature("cycleMode", value)
         if value.value == "Fixed":
-            # Also apply 'frameCount'
+            # 'frameCount' can only be set when in 'Fixed' cycle mode
             self.set_feature("frameCount", self.frameCount)
 
     @UInt32(
@@ -247,6 +283,7 @@ class AndorSdk3Camera(CameraImageSource):
         if self.camera.CameraAcquiring:
             self.camera.AcquisitionStop()
         self.camera.flush()
+        # XXX Do we need to free allocated buffers?
 
     @Slot(
         displayedName="Stop",
@@ -283,20 +320,14 @@ class AndorSdk3Camera(CameraImageSource):
         allowedStates={State.UNKNOWN, State.ON})
     async def aoiHBin(self, value):
         self.set_feature("aoiHBin", value)
-        if self.camera:
-            # XXX also update_schema_andor() might be required
-            await self.update_output_schema_andor()
 
     @UInt32(
         displayedName="ROI Width",
         description="Width of the region of interest.",
         minInc=1,
         allowedStates={State.UNKNOWN, State.ON})
-    async def aoiWitdh(self, value):
-        self.set_feature("aoiWitdh", value)
-        if self.camera:
-            # XXX also update_schema_andor() might be required
-            await self.update_output_schema_andor()
+    async def aoiWidth(self, value):
+        self.set_feature("aoiWidth", value)
 
     @UInt32(
         displayedName="ROI X",
@@ -317,9 +348,6 @@ class AndorSdk3Camera(CameraImageSource):
         allowedStates={State.UNKNOWN, State.ON})
     async def aoiVBin(self, value):
         self.set_feature("aoiVBin", value)
-        if self.camera:
-            # XXX also update_schema_andor() might be required
-            await self.update_output_schema_andor()
 
     @UInt32(
         displayedName="ROI Height",
@@ -328,9 +356,6 @@ class AndorSdk3Camera(CameraImageSource):
         allowedStates={State.UNKNOWN, State.ON})
     async def aoiHeight(self, value):
         self.set_feature("aoiHeight", value)
-        if self.camera:
-            # XXX also update_schema_andor() might be required
-            await self.update_output_schema_andor()
 
     @UInt32(
         displayedName="ROI Y",
@@ -357,10 +382,6 @@ class AndorSdk3Camera(CameraImageSource):
             raise NotImplementedError(f"{value.value} is not yet supported")
 
         self.set_feature("pixelEncoding", value)
-        if self.camera:
-            self.bitDepth = self.camera.BitDepth
-            self.bytesPerPixel = self.camera.BytesPerPixel
-            await self.update_output_schema_andor()
 
     bitDepth = String(
         displayedName="Bit Depth",
@@ -561,16 +582,18 @@ class AndorSdk3Camera(CameraImageSource):
 
         self.camera.MetadataEnable = True
 
+        await self.update_output_schema_andor()
+
+        await self.update_schema_andor()
+
         self.cameraModel = self.camera.CameraModel
         self.interfaceType = self.camera.InterfaceType
         self.firmwareVersion = self.camera.FirmwareVersion
         self.clockFrequency = self.camera.TimestampClockFrequency
+        self.bitDepth = self.camera.BitDepth
+        self.bytesPerPixel = self.camera.BytesPerPixel
         self.pixelHeight = self.camera.PixelHeight
         self.pixelWidth = self.camera.PixelWidth
-
-        await self.update_output_schema_andor()
-
-        await self.update_schema_andor()
 
         # Start polling
         self.connect_or_poll_task = background(self.poll_camera())
@@ -579,6 +602,9 @@ class AndorSdk3Camera(CameraImageSource):
             self.state = State.ON
 
     async def update_output_schema_andor(self):
+        if not self.camera:
+            return
+
         heigth = self.camera.AOIHeight
         width = self.camera.AOIWidth
         shape = (heigth, width)
@@ -589,35 +615,62 @@ class AndorSdk3Camera(CameraImageSource):
             f"Update output schema: shape={shape} dtype={dtype}")
         await self.update_output_schema(shape, EncodingType.GRAY, dtype)
 
+    def update_options(self, key, config):
+        """
+        Updates the options for the device parameter specified by the key.
+        This function will also update the 'config' dict in case the current
+        value of the property is none of the available options.
+
+        In order to inject the new options to the schema,
+        'publishInjectedParameters' must be called.
+
+        :param key: The key of the property for which we want to update options
+        :param config: The configuration dict, which will be updated with a new
+        value for 'key' in case the current value on the device is none of the
+        available options.
+        """
+        if not self.camera:
+            return
+
+        # XXX Possibly skip read-only parameters
+
+        feature = FEATURE_MAP[key]
+        feature_type = getattr(self.camera, f"type_{feature}")
+        if feature_type == "enumerated_string":
+            options = getattr(self.camera, f"options_{feature}")
+            self.logger.debug(f"Setting new options for {key}: {options}")
+            # XXX Also change defaultValue if not in options
+            setattr(self.__class__, key, Overwrite(options=options))
+            value = getattr(self, key)
+            if isSet(value) and value.value not in options:
+                config[key] = options[0]
+
+        elif feature_type in ("float", "int"):
+            min_value = getattr(self.camera, f"min_{feature}")
+            max_value = getattr(self.camera, f"max_{feature}")
+            self.logger.debug(
+                f"Setting new range for {key}: {min_value} - {max_value}")
+            # Also change defaultVale if not within range
+            setattr(self.__class__, key, Overwrite(
+                minInc=min_value, maxInc=max_value))
+            value = getattr(self, key)
+            if isSet(value):
+                if value.value < min_value:
+                    config[key] = min_value
+                elif value.value > max_value:
+                    config[key] = max_value
+
     async def update_schema_andor(self):
-        new_dict = {}
-        for key, feature in FEATURE_MAP.items():
-            feature_type = getattr(self.camera, f"type_{feature}")
-            if feature_type == "enumerated_string":
-                options = getattr(self.camera, f"options_{feature}")
-                # XXX Also change defaultValue if not in options
-                setattr(self.__class__, key, Overwrite(options=options))
-                value = getattr(self, key)
-                if isSet(value) and value.value not in options:
-                    new_dict[key] = options[0]
+        """Updates the device schema with the allowed options for the
+        camera features"""
+        new_conf = {}
+        for key in FEATURE_MAP:
+            self.update_options(key, new_conf)
 
-            elif feature_type in ("float", "int"):
-                min_value = getattr(self.camera, f"min_{feature}")
-                max_value = getattr(self.camera, f"max_{feature}")
-                # Also change defaultVale if not within range
-                setattr(self.__class__, key, Overwrite(
-                    minInc=min_value, maxInc=max_value))
-                value = getattr(self, key)
-                if isSet(value):
-                    if value.value < min_value:
-                        new_dict[key] = min_value
-                    elif value.value > max_value:
-                        new_dict[key] = max_value
-
-        await self.publishInjectedParameters(**new_dict)
+        await self.publishInjectedParameters(**new_conf)
 
     def synchronize_camera(self):
-        """Synchronize camera internal clock and Karabo time"""
+        """Synchronizes the camera internal clock and the Karabo time"""
         self.timestampClock = self.camera.TimestampClock
         self.reference_time = time()
 
@@ -688,3 +741,30 @@ class AndorSdk3Camera(CameraImageSource):
             if self.camera.CameraAcquiring:
                 self.camera.AcquisitionStop()
             self.camera.flush()
+
+    async def slotReconfigure(self, conf, message):
+        self.logger.debug(f"slotReconfigure: conf = {conf}")
+        await super().slotReconfigure(conf, message)
+
+        # Create a list of parameters for which the value or options have
+        # potentially changed
+        keys = []
+        for k in conf:
+            if k in RELATED_PROPERTIES:
+                keys.extend(RELATED_PROPERTIES[k])
+
+        # Update options
+        new_conf = {}
+        for key in keys:
+            self.update_options(key, new_conf)
+        await self.publishInjectedParameters(**new_conf)
+
+        # Update values
+        for key in keys:
+            self.sync_feature(key)
+
+        if SCHEMA_CHANGING_PROPERTIES.intersection(conf):
+            # Output channel schema needs update
+            await self.update_output_schema_andor()
+
+    slotReconfigure = coslot(slotReconfigure, passMessage=True)
