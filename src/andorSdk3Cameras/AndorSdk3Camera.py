@@ -223,9 +223,13 @@ class AndorSdk3Camera(CameraImageSource):
 
         self.camera.AcquisitionStart()
 
+        image_count = 0
+        cycle_mode = self.camera.CycleMode
+        frame_count = self.camera.FrameCount
         while True:
             try:
                 img = self.camera.wait_buffer(timeout=1000)  # timeout in ms
+                image_count += 1
                 current_time = time()
                 data = img.image  # ndarray
                 camera_clock = img.metadata.timestamp  # "ticks" since power up
@@ -261,7 +265,10 @@ class AndorSdk3Camera(CameraImageSource):
 
             except CameraException as e:
                 if not self.camera.CameraAcquiring:
-                    # e.g. reached frame count in fixed cycle mode
+                    self.state = State.ON
+                    break
+                elif cycle_mode == "Fixed" and image_count >= frame_count:
+                    self.status = "Reached frame count in fixed cycle mode"
                     self.state = State.ON
                     break
                 elif e.err_code == ErrorCodes.AT_ERR_TIMEDOUT:
