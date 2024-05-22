@@ -311,6 +311,14 @@ class AndorSdk3Camera(CameraImageSource):
         self.status = "Acquisition Stopped"
 
     @Slot(
+        displayedName="Trigger",
+        description="Send software trigger to the camera.",
+        allowedStates=[State.ACQUIRING])
+    async def trigger(self):
+        if self.camera.TriggerMode == "Software":
+            self.camera.SoftwareTrigger()
+
+    @Slot(
         displayedName="Reset",
         description="Acknowledge errors.",
         allowedStates={State.ERROR})
