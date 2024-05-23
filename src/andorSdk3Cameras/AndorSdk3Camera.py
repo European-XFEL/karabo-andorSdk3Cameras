@@ -264,7 +264,15 @@ class AndorSdk3Camera(CameraImageSource):
                 break
 
             except CameraException as e:
-                if not self.camera.CameraAcquiring:
+                try:
+                    # In case the camera went offline during acquisition,
+                    # accessing self.camera.CameraAcquiring will throw
+                    camera_acquiring = self.camera.CameraAcquiring
+                except CameraException:
+                    await self.disconnection_handler()
+                    break
+
+                if not camera_acquiring:
                     self.state = State.ON
                     break
                 elif cycle_mode == "Fixed" and image_count >= frame_count:
@@ -272,7 +280,7 @@ class AndorSdk3Camera(CameraImageSource):
                     self.state = State.ON
                     break
                 elif e.err_code == ErrorCodes.AT_ERR_TIMEDOUT:
-                    # e.g. waiting for external trigger
+                    # e.g. waiting for external/software trigger
                     continue
                 else:
                     self.status = f"Exception in acquire_task: {e}"
@@ -289,8 +297,7 @@ class AndorSdk3Camera(CameraImageSource):
 
         if self.camera.CameraAcquiring:
             self.camera.AcquisitionStop()
-        self.camera.flush()
-        # XXX Do we need to free allocated buffers?
+        self.camera.flush()  # cleans any existing queued buffers
 
     @Slot(
         displayedName="Stop",
@@ -303,9 +310,11 @@ class AndorSdk3Camera(CameraImageSource):
             self.acq_task.cancel()
             try:
                 await self.acq_task
-            except (Exception, CancelledError):
+            except CancelledError:
                 pass
             self.acq_task = None
+
+        self.camera.flush()  # cleans any existing queued buffers
 
         self.state = State.ON
         self.status = "Acquisition Stopped"
@@ -724,6 +733,8 @@ class AndorSdk3Camera(CameraImageSource):
             self.acq_task.cancel()
             self.acq_task = None
 
+        self.camera.flush()  # cleans any existing queued buffers
+
         if self.connect_or_poll_task:
             self.connect_or_poll_task.cancel()
 
@@ -755,7 +766,7 @@ class AndorSdk3Camera(CameraImageSource):
         if self.camera:
             if self.camera.CameraAcquiring:
                 self.camera.AcquisitionStop()
-            self.camera.flush()
+            self.camera.flush()  # cleans any existing queued buffers
 
     async def slotReconfigure(self, conf, message):
         self.logger.debug(f"slotReconfigure: conf = {conf}")
