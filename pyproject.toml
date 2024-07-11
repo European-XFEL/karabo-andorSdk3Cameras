@@ -9,9 +9,6 @@ write_to = "src/andorSdk3Cameras/_version.py"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-AndorSdk3Cameras = ["data/*.*"]
-
 [project.entry-points."karabo.middlelayer_device"]
 AndorSdk3Camera = "andorSdk3Cameras.AndorSdk3Camera:AndorSdk3Camera"
 
