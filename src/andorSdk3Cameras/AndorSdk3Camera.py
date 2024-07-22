@@ -20,7 +20,7 @@ from pyAndorSDK3 import AndorSDK3, CameraException, ErrorCodes
 
 from imageSourcePy.CameraImageSourceMdl import CameraImageSource
 from karabo.middlelayer import (
-    AccessMode, Assignment, Bool, Double, EncodingType, MetricPrefix,
+    AccessMode, Assignment, Bool, Double, EncodingType, Hash, MetricPrefix,
     Overwrite, Slot, State, String, Timestamp, UInt8, UInt16, UInt32, UInt64,
     Unit, background, coslot, isSet, sleep)
 from processing_utils.moving_average import MovingAverage
@@ -38,6 +38,14 @@ DATA_TYPE_MAP = {
 
 FEATURE_MAP = {
     # Karabo Key: Feature Name
+    "cameraModel": "CameraModel",
+    "interfaceType": "InterfaceType",
+    "firmwareVersion": "FirmwareVersion",
+    "clockFrequency": "TimestampClockFrequency",
+    "bitDepth": "BitDepth",
+    "bytesPerPixel": "BytesPerPixel",
+    "pixelHeight": "PixelHeight",
+    "pixelWidth": "PixelWidth",
     "cycleMode": "CycleMode",
     "frameCount": "FrameCount",
     "exposureTime": "ExposureTime",
@@ -57,21 +65,13 @@ FEATURE_MAP = {
     "electronicShutteringMode": "ElectronicShutteringMode",
     "fanSpeed": "FanSpeed",
     "sensorCooling": "SensorCooling",
+    "sensorTemperature": "SensorTemperature",
+    "temperatureStatus": "TemperatureStatus",
     "temperatureControl": "TemperatureControl"}
 
-# Updating a camera feature can affect the value or options of another one.
-# Here is a dictionary of known relations.
-RELATED_PROPERTIES = {
-    # Karabo <key>: Properties potentially affected by a change in <key>
-    "exposureTime": ("frameRateTarget",),
-    "pixelReadoutRate": ("frameRateTarget", ),
-    "pixelEncoding": ("bitDepth", "bytesPerPixel", ),
-    "aoiHBin": ("aoiWidth", ),
-    "aoiWidth": ("aoiLeft", ),
-    "aoiLeft": ("aoiWidth", ),
-    "aoiVBin": ("aoiHeight", ),
-    "aoiHeight": ("aoiTop", ),
-    "aoiTop": ("aoiHeight", )}
+KEY_MAP = {
+    # Feature Name: Karabo Key
+    feature: key for key, feature in FEATURE_MAP.items()}
 
 # Updating some camera features will affect e.g. the image shape or data type,
 # thus a schema update for the output channel will be needed.
@@ -86,6 +86,24 @@ class AndorSdk3Camera(CameraImageSource):
     __version__ = deviceVersion
 
     camera = None
+    sdk3 = AndorSDK3()
+
+    def register_callback(self, feature):
+        @self.sdk3.event_callback
+        def inner(handle, feature):
+            key = KEY_MAP[feature]
+            new_value = getattr(self.camera, feature)
+
+            # Update options
+            self.update_options(key)
+
+            # Update value on the device
+            if getattr(self, key).value != new_value:
+                setattr(self, key, new_value)
+                self.logger.debug(
+                    f"Feature update: feature={feature} value={new_value}")
+
+        self.camera.register_feature_callback(feature, inner)
 
     def sync_feature(self, key):
         """Synchronizes the property in the Karabo device with the current
@@ -490,18 +508,19 @@ class AndorSdk3Camera(CameraImageSource):
         self.frame_rate_task = background(self.refresh_frame_rate())
         self.acq_task = None
         self.connect_or_poll_task = None
+        self.must_update_schema = False
 
-    def connect(self, sdk3):
+    def connect(self):
         """Try to connect (for the first time) to the camera"""
         if self.camera:
             raise RuntimeError(
                 "This function can only be called to connect to the camera "
                 "the first time.")
 
-        self.logger.debug(f"connect: Found {sdk3.DeviceCount} cameras")
-        for idx in range(sdk3.DeviceCount):
+        self.logger.debug(f"connect: Found {self.sdk3.DeviceCount} cameras")
+        for idx in range(self.sdk3.DeviceCount):
             try:
-                cam = sdk3.GetCamera(idx)
+                cam = self.sdk3.GetCamera(idx)
                 self.logger.debug(f"connect: Found camera {cam.SerialNumber}")
                 if cam.SerialNumber == self.serialNumber:
                     return cam
@@ -551,9 +570,8 @@ class AndorSdk3Camera(CameraImageSource):
             f"Trying to reconnect in {RECONNECT_TIME} s.")
         connected_msg = f"Connected to {self.serialNumber}"
 
-        sdk3 = AndorSDK3()
         while True:
-            cam = self.connect(sdk3)
+            cam = self.connect()
             if cam:
                 break
 
@@ -564,7 +582,7 @@ class AndorSdk3Camera(CameraImageSource):
             # Reinitialize the library in order to re-discover cameras
             # NB This will block forever if called again after a camera
             # has been already discovered!
-            sdk3.Reinitialise()
+            self.sdk3.Reinitialise()
 
         self.camera = cam
         self.status = connected_msg
@@ -576,17 +594,20 @@ class AndorSdk3Camera(CameraImageSource):
     async def initialize_camera(self):
         """This function does the initial setup of the camera"""
         schema_hash = self.getDeviceSchema().hash
+        config_hash = Hash()
 
         for key, feature in FEATURE_MAP.items():
             access_mode = schema_hash.getAttribute(key, "accessMode")
-            if access_mode not in (
+            if access_mode in (
                     AccessMode.INITONLY.value,
                     AccessMode.RECONFIGURABLE.value):
-                # The parameter is read-only
-                continue
+                # The parameter is writeable
+                is_writable = True
+            else:
+                is_writable = False
 
             value = getattr(self, key, None)
-            if isSet(value):
+            if isSet(value) and is_writable:
                 # Set values to the camera
                 try:
                     self.logger.debug(
@@ -602,22 +623,20 @@ class AndorSdk3Camera(CameraImageSource):
                 # Read values from the camera
                 value = getattr(self.camera, feature)
                 self.logger.debug(f"{feature}: {value}")
-                setattr(self, key, value)
+                config_hash[key] = value
+
+            # Register feature callback
+            self.register_callback(feature)
 
         self.camera.MetadataEnable = True
 
+        # Ranges and options have been updated by the callback function,
+        # now we need to publish the new schema.
+        self.logger.debug(
+            f"Parameters update: {config_hash}")
+        await self.publishInjectedParameters(**config_hash)
+
         await self.update_output_schema_andor()
-
-        await self.update_schema_andor()
-
-        self.cameraModel = self.camera.CameraModel
-        self.interfaceType = self.camera.InterfaceType
-        self.firmwareVersion = self.camera.FirmwareVersion
-        self.clockFrequency = self.camera.TimestampClockFrequency
-        self.bitDepth = self.camera.BitDepth
-        self.bytesPerPixel = self.camera.BytesPerPixel
-        self.pixelHeight = self.camera.PixelHeight
-        self.pixelWidth = self.camera.PixelWidth
 
         # Start polling
         self.connect_or_poll_task = background(self.poll_camera())
@@ -639,59 +658,71 @@ class AndorSdk3Camera(CameraImageSource):
             f"Update output schema: shape={shape} dtype={dtype}")
         await self.update_output_schema(shape, EncodingType.GRAY, dtype)
 
-    def update_options(self, key, config):
+    def update_options(self, key):
         """
         Updates the options for the device parameter specified by the key.
-        This function will also update the 'config' dict in case the current
-        value of the property is none of the available options.
 
         In order to inject the new options to the schema,
         'publishInjectedParameters' must be called.
 
         :param key: The key of the property for which we want to update options
-        :param config: The configuration dict, which will be updated with a new
-        value for 'key' in case the current value on the device is none of the
-        available options.
         """
         if not self.camera:
             return
 
-        # XXX Possibly skip read-only parameters
+        # Skip read-only and init-only parameters
+        schema_hash = self.getDeviceSchema().hash
+        access_mode = schema_hash.getAttribute(key, "accessMode")
+        if access_mode != AccessMode.RECONFIGURABLE.value:
+            return
 
         feature = FEATURE_MAP[key]
         feature_type = getattr(self.camera, f"type_{feature}")
+        default_value = None
+        if "defaultValue" in schema_hash.getAttributes(key):
+            default_value = schema_hash.getAttribute(key, "defaultValue")
+        options = None
+        min_inc = None
+        max_inc = None
+
         if feature_type == "enumerated_string":
-            options = getattr(self.camera, f"options_{feature}")
-            self.logger.debug(f"Setting new options for {key}: {options}")
-            # XXX Also change defaultValue if not in options
-            setattr(self.__class__, key, Overwrite(options=options))
-            value = getattr(self, key)
-            if isSet(value) and value.value not in options:
-                config[key] = options[0]
+            new_options = getattr(self.camera, f"options_{feature}")
+            if "options" in schema_hash.getAttributes(key):
+                options = schema_hash.getAttribute(key, "options")
+            if options == new_options:
+                # No change in options
+                return
+            if default_value and default_value not in new_options:
+                default_value = new_options[0]
+
+            self.logger.debug(
+                f"Setting new options for {key}: {new_options}")
+            # Also change defaultValue if not in options
+            setattr(self.__class__, key, Overwrite(
+                options=new_options, defaultValue=default_value))
+            self.must_update_schema = True
 
         elif feature_type in ("float", "int"):
-            min_value = getattr(self.camera, f"min_{feature}")
-            max_value = getattr(self.camera, f"max_{feature}")
+            new_min = getattr(self.camera, f"min_{feature}")
+            new_max = getattr(self.camera, f"max_{feature}")
+            if "minInc" in schema_hash.getAttributes(key):
+                min_inc = schema_hash.getAttribute(key, "minInc")
+            if "maxInc" in schema_hash.getAttributes(key):
+                max_inc = schema_hash.getAttribute(key, "maxInc")
+            if min_inc == new_min and max_inc == new_max:
+                # No change in allowed range
+                return
+
+            if default_value and (
+                    default_value < new_min or default_value > new_max):
+                default_value = new_min
+
             self.logger.debug(
-                f"Setting new range for {key}: {min_value} - {max_value}")
-            # Also change defaultVale if not within range
+                f"Setting new range for {key}: {new_min} - {new_max}")
+            # Also change defaultValue if not within range
             setattr(self.__class__, key, Overwrite(
-                minInc=min_value, maxInc=max_value))
-            value = getattr(self, key)
-            if isSet(value):
-                if value.value < min_value:
-                    config[key] = min_value
-                elif value.value > max_value:
-                    config[key] = max_value
-
-    async def update_schema_andor(self):
-        """Updates the device schema with the allowed options for the
-        camera features"""
-        new_conf = {}
-        for key in FEATURE_MAP:
-            self.update_options(key, new_conf)
-
-        await self.publishInjectedParameters(**new_conf)
+                minInc=new_min, maxInc=new_max, defaultValue=default_value))
+            self.must_update_schema = True
 
     def synchronize_camera(self):
         """Synchronizes the camera internal clock and the Karabo time"""
@@ -706,8 +737,8 @@ class AndorSdk3Camera(CameraImageSource):
                 # Synchronize camera internal clock and Karabo time
                 self.synchronize_camera()
 
-                self.sensorTemperature = self.camera.SensorTemperature
-                self.temperatureStatus = self.camera.TemperatureStatus
+                for key in ("sensorTemperature", "temperatureStatus"):
+                    self.sync_feature(key)
 
                 error_count = 0
 
@@ -772,22 +803,10 @@ class AndorSdk3Camera(CameraImageSource):
         self.logger.debug(f"slotReconfigure: conf = {conf}")
         await super().slotReconfigure(conf, message)
 
-        # Create a list of parameters for which the value or options have
-        # potentially changed
-        keys = []
-        for k in conf:
-            if k in RELATED_PROPERTIES:
-                keys.extend(RELATED_PROPERTIES[k])
-
-        # Update options
-        new_conf = {}
-        for key in keys:
-            self.update_options(key, new_conf)
-        await self.publishInjectedParameters(**new_conf)
-
-        # Update values
-        for key in keys:
-            self.sync_feature(key)
+        if self.must_update_schema:
+            self.logger.debug("Injecting new schema")
+            await self.publishInjectedParameters()
+            self.must_update_schema = False
 
         if SCHEMA_CHANGING_PROPERTIES.intersection(conf):
             # Output channel schema needs update
