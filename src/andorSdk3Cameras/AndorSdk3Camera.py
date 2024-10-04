@@ -57,12 +57,17 @@ FEATURE_MAP = {
     "aoiHeight": "AOIHeight",
     "aoiTop": "AOITop",
     "pixelReadoutRate": "PixelReadoutRate",
+    "simplePreAmpGainControl": "SimplePreAmpGainControl",
     "pixelEncoding": "PixelEncoding",
     "bitDepth": "BitDepth",
     "bytesPerPixel": "BytesPerPixel",
     "triggerMode": "TriggerMode",
     "externalTriggerDelay": "ExternalTriggerDelay",
+    "rollingShutterGlobalClear": "RollingShutterGlobalClear",
     "electronicShutteringMode": "ElectronicShutteringMode",
+    "baseline": "Baseline",
+    "staticBlemishCorrection": "StaticBlemishCorrection",
+    "spuriousNoiseFilter": "SpuriousNoiseFilter",
     "fanSpeed": "FanSpeed",
     "sensorCooling": "SensorCooling",
     "sensorTemperature": "SensorTemperature",
@@ -76,7 +81,8 @@ KEY_MAP = {
 # Updating some camera features will affect e.g. the image shape or data type,
 # thus a schema update for the output channel will be needed.
 SCHEMA_CHANGING_PROPERTIES = {
-    "aoiHBin", "aoiWidth", "aoiVBin", "aoiHeight", "pixelEncoding"}
+    "aoiHBin", "aoiWidth", "aoiVBin", "aoiHeight", "simplePreAmpGainControl",
+    "pixelEncoding"}
 
 # Sleep time between two connect attempts
 RECONNECT_TIME = 5
@@ -416,6 +422,12 @@ class AndorSdk3Camera(CameraImageSource):
         self.set_feature("pixelReadoutRate", value)
 
     @String(
+        displayedName="Simple Pre-Amp Gain Control",
+        allowedStates={State.UNKNOWN, State.ON})
+    async def simplePreAmpGainControl(self, value):
+        self.set_feature("simplePreAmpGainControl", value)
+
+    @String(
         displayedName="Pixel Encoding",
         defaultValue="Mono12Packed",
         allowedStates={State.UNKNOWN, State.ON})
@@ -459,12 +471,36 @@ class AndorSdk3Camera(CameraImageSource):
     async def externalTriggerDelay(self, value):
         self.set_feature("externalTriggerDelay", value)
 
+    @Bool(
+        displayedName="Rolling Shutter Global Clear",
+        allowedStates={State.UNKNOWN, State.ON})
+    async def rollingShutterGlobalClear(self, value):
+        self.set_feature("rollingShutterGlobalClear", value)
+
     @String(
         displayedName="Electronic Shutter Mode",
         defaultValue="Rolling",
         allowedStates={State.UNKNOWN, State.ON})
     async def electronicShutteringMode(self, value):
         self.set_feature("electronicShutteringMode", value)
+
+    @UInt16(
+        displayedName="Baseline",
+        allowedStates={State.UNKNOWN, State.ON})
+    async def baseline(self, value):
+        self.set_feature("baseline", value)
+
+    @Bool(
+        displayedName="Static Blemish Correction",
+        allowedStates={State.UNKNOWN, State.ON})
+    async def staticBlemishCorrection(self, value):
+        self.set_feature("staticBlemishCorrection", value)
+
+    @Bool(
+        displayedName="Spurious Noise Filter",
+        allowedStates={State.UNKNOWN, State.ON})
+    async def spuriousNoiseFilter(self, value):
+        self.set_feature("spuriousNoiseFilter", value)
 
     @String(
         displayedName="Fan Speed",
