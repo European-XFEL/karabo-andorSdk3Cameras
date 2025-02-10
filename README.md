@@ -14,8 +14,12 @@ script:
 Also, in order to make the Andor cameras accessible to a normal (non-root)
 user, appropriate USB rules need to be defined.
 
-This is done by root by copying the ``99-andor-cameras.rules`` file from
-``$KARABO/extern/andor/etc/`` to ``/etc/udev/rules.d/``.
+This is done by root by creating the ``99-andor-cameras.rules`` in
+``/etc/udev/rules.d/``.
+
+For the Andor Zyla camera the file has to contain
+
+    ATTRS{idVendor}=="136e",ATTRS{idProduct}=="0014",MODE="0666",GROUP="exfel"
 
 After the rules have been created, they can be loaded by rebooting the host,
 or by executing
