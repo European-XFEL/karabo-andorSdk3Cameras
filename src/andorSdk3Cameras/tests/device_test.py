@@ -19,7 +19,7 @@ from karabo.middlelayer.testing import AsyncDeviceContext, event_loop
 from ..AndorSdk3Camera import AndorSdk3Camera
 
 _DEVICE_CONFIG = {
-    "_deviceId_": "TestAndorSdk3Camera",
+    "deviceId": "TestAndorSdk3Camera",
     "serialNumber": "S01234"
 }
 

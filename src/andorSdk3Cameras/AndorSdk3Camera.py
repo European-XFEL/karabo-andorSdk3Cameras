@@ -20,7 +20,7 @@ from pyAndorSDK3 import AndorSDK3, CameraException, ErrorCodes
 
 from imageSourcePy.CameraImageSourceMdl import CameraImageSource
 from karabo.middlelayer import (
-    AccessMode, Assignment, Bool, Double, EncodingType, Hash, MetricPrefix,
+    AccessMode, Assignment, Bool, Double, Encoding, Hash, MetricPrefix,
     Overwrite, Slot, State, String, Timestamp, UInt8, UInt16, UInt32, UInt64,
     Unit, background, coslot, isSet, sleep)
 from processing_utils.moving_average import MovingAverage
@@ -269,7 +269,7 @@ class AndorSdk3Camera(CameraImageSource):
                     f"camera clock: {camera_clock} latency: {latency}")
 
                 await self.write_channels(
-                    data, encoding=EncodingType.GRAY, timestamp=ts)
+                    data, encoding=Encoding.GRAY, timestamp=ts)
 
                 # Reuse buffer
                 self.camera.queue(img._np_data, img_size)
@@ -692,7 +692,7 @@ class AndorSdk3Camera(CameraImageSource):
 
         self.logger.debug(
             f"Update output schema: shape={shape} dtype={dtype}")
-        await self.update_output_schema(shape, EncodingType.GRAY, dtype)
+        await self.update_output_schema(shape, Encoding.GRAY, dtype)
 
     def update_options(self, key):
         """

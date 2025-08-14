@@ -20,5 +20,4 @@ authors = [
 ]
 description = ""
 readme = "README.md"
-dependencies = [
-]
+dependencies = ["imageSourcePy ~= 3.0.0", "processingUtils ~= 1.4.2"]
