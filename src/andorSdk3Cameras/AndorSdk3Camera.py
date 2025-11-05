@@ -22,7 +22,7 @@ from imageSourcePy.CameraImageSourceMdl import CameraImageSource
 from karabo.middlelayer import (
     AccessMode, Assignment, Bool, Double, Encoding, Hash, MetricPrefix,
     Overwrite, Slot, State, String, Timestamp, UInt8, UInt16, UInt32, UInt64,
-    Unit, background, coslot, isSet, sleep)
+    Unit, background, coslot, has_changes, isSet, sleep)
 from processing_utils.moving_average import MovingAverage
 from processing_utils.rate_calculator import RateCalculator
 
@@ -104,7 +104,8 @@ class AndorSdk3Camera(CameraImageSource):
             self.update_options(key)
 
             # Update value on the device
-            if getattr(self, key).value != new_value:
+            old_value = getattr(self, key)
+            if has_changes(old_value, new_value):
                 setattr(self, key, new_value)
                 self.logger.debug(
                     f"Feature update: feature={feature} value={new_value}")
