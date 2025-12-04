@@ -458,7 +458,7 @@ class AndorSdk3Camera(CameraImageSource):
 
     @String(
         displayedName="Pixel Encoding",
-        defaultValue="Mono12Packed",
+        defaultValue="Mono16",
         allowedStates={State.UNKNOWN, State.ON})
     async def pixelEncoding(self, value):
         if value.value not in DATA_TYPE_MAP:
