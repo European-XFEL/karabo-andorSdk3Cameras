@@ -12,7 +12,7 @@
 # Karabo itself is licensed under the terms of the MPL 2.0 license.
 #############################################################################
 
-from asyncio import CancelledError
+from asyncio import CancelledError, wait_for
 from time import time
 
 import numpy as np
@@ -22,7 +22,8 @@ from imageSourcePy.CameraImageSourceMdl import CameraImageSource
 from karabo.middlelayer import (
     AccessMode, Assignment, Bool, Double, Encoding, Hash, MetricPrefix,
     Overwrite, Slot, State, String, Timestamp, UInt8, UInt16, UInt32, UInt64,
-    Unit, background, coslot, has_changes, isSet, sleep)
+    Unit, background, coslot, get_timestamp, getProperties, has_changes, isSet,
+    sleep)
 from processing_utils.moving_average import MovingAverage
 from processing_utils.rate_calculator import RateCalculator
 
@@ -86,6 +87,19 @@ SCHEMA_CHANGING_PROPERTIES = {
 
 # Sleep time between two connect attempts
 RECONNECT_TIME = 5
+
+
+async def get_timeserver_time(timeserver_id):
+    """Get current tid, timestamp and period from timeserver"""
+    props = await getProperties(timeserver_id, ["id", "periodActual"])
+
+    tid = props["id"]  # reference tid from timeserver
+    timestamp = (  # reference timestamp from timeserver
+        props.getAttributes("id")["sec"]
+        + props.getAttributes("id")["frac"] / 10**18)
+    period = props["periodActual"] / 1000  # ms -> s
+
+    return tid, timestamp, period
 
 
 class AndorSdk3Camera(CameraImageSource):
@@ -255,7 +269,11 @@ class AndorSdk3Camera(CameraImageSource):
             try:
                 img = self.camera.wait_buffer(timeout=1000)  # timeout in ms
                 image_count += 1
-                current_time = time()
+
+                current_timestamp = get_timestamp()
+                current_tid = current_timestamp.tid
+                current_time = current_timestamp.toTimestamp()
+
                 data = img.image  # ndarray
                 camera_clock = img.metadata.timestamp  # "ticks" since power up
 
@@ -265,9 +283,19 @@ class AndorSdk3Camera(CameraImageSource):
                     self.clockFrequency.value + self.reference_time)
                 latency, _ = self.image_latency(current_time - image_time)
                 ts = Timestamp(image_time)
+                if None in (self.ts_tid, self.ts_timestamp, self.ts_period):
+                    # No reference info from timeserver. Use actual tid
+                    ts.tid = current_tid
+                else:
+                    delta_tid = int(
+                        (image_time - self.ts_timestamp) / self.ts_period)
+                    ts.tid = self.ts_tid + delta_tid
+
                 self.logger.debug(
                     f"Received new image: shape: {data.shape} "
-                    f"camera clock: {camera_clock} latency: {latency}")
+                    f"current time: {current_time} current tid: {current_tid} "
+                    f"camera clock: {camera_clock} latency: {latency} "
+                    f"corrected tid: {ts.tid}")
 
                 await self.write_channels(
                     data, encoding=Encoding.GRAY, timestamp=ts)
@@ -540,9 +568,12 @@ class AndorSdk3Camera(CameraImageSource):
 
     def __init__(self, configuration):
         super().__init__(configuration)
+        self.ts_tid = None
+        self.ts_timestamp = None
+        self.ts_period = None
         self.frame_rate = RateCalculator(refresh_interval=1.0)
         self.image_latency = MovingAverage(window_size=10)
-        self.frame_rate_task = background(self.refresh_frame_rate())
+        self.frame_rate_task = None
         self.acq_task = None
         self.connect_or_poll_task = None
         self.must_update_schema = False
@@ -606,6 +637,8 @@ class AndorSdk3Camera(CameraImageSource):
             "It could be OFF or controlled by another application. "
             f"Trying to reconnect in {RECONNECT_TIME} s.")
         connected_msg = f"Connected to {self.serialNumber}"
+
+        self.frame_rate_task = background(self.refresh_frame_rate())
 
         while True:
             cam = self.connect()
@@ -811,7 +844,17 @@ class AndorSdk3Camera(CameraImageSource):
         self.connect_or_poll_task = background(self.reconnect())
 
     async def refresh_frame_rate(self):
+        timeserver_id = self.slotGetTime()["timeServerId"]
         while True:
+            # Get current tid, timestamp and period from timeserver
+            try:
+                self.ts_tid, self.ts_timestamp, self.ts_period = (
+                    await wait_for(get_timeserver_time(timeserver_id), 1))
+            except Exception:
+                # Timeserver is offline or not defined. Continue without.
+                self.ts_tid, self.ts_timestamp, self.ts_period = (
+                    None, None, None)
+
             fps = self.frame_rate.refresh()
             if self.state == State.ACQUIRING:
                 if fps:
