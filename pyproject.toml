@@ -15,9 +15,26 @@ AndorSdk3Camera = "andorSdk3Cameras.AndorSdk3Camera:AndorSdk3Camera"
 [project]
 dynamic = ["version"]
 name = "AndorSdk3Cameras"
+keywords = ["Karabo", "SCADA", "camera", "control system"]
 authors = [
-    {name = "parenti"},
+    {name = "Andrea Parenti", email = "andrea.parenti@xfel.eu"},
 ]
-description = ""
+description = "This package provides a Karabo control device Andor sCMOS cameras."
 readme = "README.md"
+
+# Classifiers help users find your project by categorizing it.
+#
+# For a list of valid classifiers, see https://pypi.org/classifiers/
+classifiers = [
+  # How mature is this project? Common values are
+  #   3 - Alpha
+  #   4 - Beta
+  #   5 - Production/Stable
+  "Development Status :: 5 - Production/Stable",
+
+  # Indicate who your project is intended for
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+]
+
 dependencies = ["imageSourcePy ~= 3.0.0", "processingUtils ~= 1.4.2"]
