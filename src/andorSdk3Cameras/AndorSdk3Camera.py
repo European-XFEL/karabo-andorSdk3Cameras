@@ -20,10 +20,10 @@ from pyAndorSDK3 import AndorSDK3, CameraException, ErrorCodes
 
 from imageSourcePy.CameraImageSourceMdl import CameraImageSource
 from karabo.middlelayer import (
-    AccessMode, Assignment, Bool, Double, Encoding, Hash, MetricPrefix,
-    Overwrite, Slot, State, String, Timestamp, UInt8, UInt16, UInt32, UInt64,
-    Unit, background, coslot, get_timestamp, getProperties, has_changes, isSet,
-    sleep)
+    AccessMode, Assignment, Bool, Configurable, Double, Encoding, Hash,
+    MetricPrefix, Node, Overwrite, Slot, State, String, Timestamp, UInt8,
+    UInt16, UInt32, UInt64, Unit, background, coslot, get_timestamp,
+    getProperties, has_changes, isSet, sleep)
 from processing_utils.moving_average import MovingAverage
 from processing_utils.rate_calculator import RateCalculator
 
@@ -82,8 +82,8 @@ KEY_MAP = {
 # Updating some camera features will affect e.g. the image shape or data type,
 # thus a schema update for the output channel will be needed.
 SCHEMA_CHANGING_PROPERTIES = {
-    "aoiHBin", "aoiWidth", "aoiVBin", "aoiHeight", "simplePreAmpGainControl",
-    "pixelEncoding"}
+    "aoiHBin", "aoiWidth", "aoiVBin", "aoiHeight", "rotation",
+    "simplePreAmpGainControl", "pixelEncoding"}
 
 # Sleep time between two connect attempts
 RECONNECT_TIME = 5
@@ -100,6 +100,39 @@ async def get_timeserver_time(timeserver_id):
     period = props["periodActual"] / 1000  # ms -> s
 
     return tid, timestamp, period
+
+
+def flip_and_rotate(data, flip_x, flip_y, rotation):
+    if flip_x or flip_y or rotation != 0:
+        if flip_x:
+            data = np.flipud(data)
+        if flip_y:
+            data = np.fliplr(data)
+        if rotation != 0:
+            n_rotations = rotation // 90 % 4
+            data = np.rot90(data, n_rotations)
+
+    return np.ascontiguousarray(data)
+
+
+class Flip(Configurable):
+    x = Bool(
+        displayedName="Horizontal Flip",
+        description="Enable horizontal flip. This is applied before the "
+                    "image rotation.",
+        accessMode=AccessMode.RECONFIGURABLE,
+        assignment=Assignment.OPTIONAL,
+        defaultValue=False,
+        allowedStates={State.UNKNOWN, State.ON})
+
+    y = Bool(
+        displayedName="Vertical Flip",
+        description="Enable vertical flip. This is applied before the "
+                    "image rotation.",
+        accessMode=AccessMode.RECONFIGURABLE,
+        assignment=Assignment.OPTIONAL,
+        defaultValue=False,
+        allowedStates={State.UNKNOWN, State.ON})
 
 
 class AndorSdk3Camera(CameraImageSource):
@@ -297,6 +330,10 @@ class AndorSdk3Camera(CameraImageSource):
                     f"camera clock: {camera_clock} latency: {latency} "
                     f"corrected tid: {ts.tid}")
 
+                # Flip and rotate image
+                data = flip_and_rotate(
+                    data, self.flip.x, self.flip.y, self.rotation.value)
+
                 await self.write_channels(
                     data, encoding=Encoding.GRAY, timestamp=ts)
 
@@ -443,6 +480,22 @@ class AndorSdk3Camera(CameraImageSource):
         allowedStates={State.UNKNOWN, State.ON})
     async def aoiTop(self, value):
         self.set_feature("aoiTop", value)
+
+    flip = Node(
+        Flip,
+        displayedName="Image Flip",
+        description="Enables mirroring of the image.")
+
+    rotation = UInt16(
+        displayedName="Image Rotation",
+        description="The image rotation. The angle must be a multiple of "
+                    "90°. The rotation is done after the image flip.",
+        accessMode=AccessMode.RECONFIGURABLE,
+        assignment=Assignment.OPTIONAL,
+        unitSymbol=Unit.DEGREE,
+        options=[0, 90, 180, 270],
+        defaultValue=0,
+        allowedStates={State.UNKNOWN, State.ON})
 
     @String(
         displayedName="Pixel Readout Rate",
@@ -718,8 +771,12 @@ class AndorSdk3Camera(CameraImageSource):
         if not self.camera:
             return
 
-        heigth = self.camera.AOIHeight
-        width = self.camera.AOIWidth
+        if self.rotation.value in (0, 180):
+            heigth = self.camera.AOIHeight
+            width = self.camera.AOIWidth
+        else:  # rotated image
+            heigth = self.camera.AOIWidth
+            width = self.camera.AOIHeight
         shape = (heigth, width)
         pixel_encoding = self.camera.PixelEncoding
         dtype = DATA_TYPE_MAP[pixel_encoding]
