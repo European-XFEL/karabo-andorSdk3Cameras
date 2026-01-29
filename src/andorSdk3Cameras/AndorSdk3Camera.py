@@ -718,6 +718,7 @@ class AndorSdk3Camera(CameraImageSource):
         """This function does the initial setup of the camera"""
         schema_hash = self.getDeviceSchema().hash
         config_hash = Hash()
+        failed = []
 
         for key, feature in FEATURE_MAP.items():
             access_mode = schema_hash.getAttribute(key, "accessMode")
@@ -737,19 +738,24 @@ class AndorSdk3Camera(CameraImageSource):
                         f"Setting {feature} = {value.value}")
                     setattr(self.camera, feature, value.value)
                 except Exception as e:
-                    if self.state != State.ERROR:
-                        self.state = State.ERROR
-                    self.status = f"Could not set {feature} on camera"
-                    self.logger.error(
-                        f"Could not set {feature} on camera: {e}")
-            else:
-                # Read values from the camera
-                value = getattr(self.camera, feature)
-                self.logger.debug(f"{feature}: {value}")
-                config_hash[key] = value
+                    # Setting of this parameter could be not allowed in the
+                    # current status of the camera
+                    failed.append(key)
+                    self.logger.warning(
+                        f"Could not set {key} on camera: {e}")
+
+            # Read back value from the camera
+            value = getattr(self.camera, feature)
+            self.logger.debug(f"Reading {feature}: {value}")
+            config_hash[key] = value
 
             # Register feature callback
             self.register_callback(feature)
+
+        if failed:
+            self.status = (
+                "The following parameters could not be set: " +
+                ", ".join(failed))
 
         self.camera.MetadataEnable = True
 
