@@ -21,8 +21,8 @@ from pyAndorSDK3 import AndorSDK3, CameraException, ErrorCodes
 from imageSourcePy.CameraImageSourceMdl import CameraImageSource
 from karabo.middlelayer import (
     AccessMode, Assignment, Bool, Configurable, Double, Encoding, Hash,
-    MetricPrefix, Node, Overwrite, Slot, State, String, Timestamp, UInt8,
-    UInt16, UInt32, UInt64, Unit, background, coslot, get_timestamp,
+    KaraboValue, MetricPrefix, Node, Overwrite, Slot, State, String, Timestamp,
+    UInt8, UInt16, UInt32, UInt64, Unit, background, coslot, get_timestamp,
     getProperties, has_changes, isSet, sleep)
 from processing_utils.moving_average import MovingAverage
 from processing_utils.rate_calculator import RateCalculator
@@ -48,9 +48,9 @@ FEATURE_MAP = {
     "pixelHeight": "PixelHeight",
     "pixelWidth": "PixelWidth",
     "cycleMode": "CycleMode",
+    # FrameCount can only be set on the camera when CycleMode==Fixed
     "frameCount": "FrameCount",
     "exposureTime": "ExposureTime",
-    "frameRateTarget": "FrameRate",
     "aoiHBin": "AOIHBin",
     "aoiWidth": "AOIWidth",
     "aoiLeft": "AOILeft",
@@ -63,6 +63,8 @@ FEATURE_MAP = {
     "bitDepth": "BitDepth",
     "bytesPerPixel": "BytesPerPixel",
     "triggerMode": "TriggerMode",
+    # FrameRate can only be set on the camera when TriggerMode==Internal
+    "frameRateTarget": "FrameRate",
     "externalTriggerDelay": "ExternalTriggerDelay",
     "rollingShutterGlobalClear": "RollingShutterGlobalClear",
     "electronicShutteringMode": "ElectronicShutteringMode",
@@ -173,14 +175,36 @@ class AndorSdk3Camera(CameraImageSource):
             setattr(self, key, value)
 
     def set_feature(self, key, value):
-        new_value = value.value
-        if self.camera:
-            feature = FEATURE_MAP[key]
-            current_value = getattr(self.camera, feature)
-            if isSet(new_value) and current_value != new_value:
+        if not isSet(value):
+            return
+
+        if not self.camera:
+            # Will be applied when the connection is established
+            setattr(self, key, value)
+            return
+
+        feature = FEATURE_MAP[key]
+        old_value = getattr(self.camera, feature)
+        new_value = value.value if isinstance(value, KaraboValue) else value
+        try:
+            if has_changes(old_value, new_value):
                 self.logger.debug(f"Setting {feature} to {new_value}")
                 setattr(self.camera, feature, new_value)
-        setattr(self, key, new_value)
+        except CameraException as e:
+            # Depending on other settings the feature might not
+            # be writable
+            msg = (
+                f"Could not set {key} on camera: {e}. This could depend on "
+                "other camera settings.")
+            self.status = msg
+            self.logger.warning(msg)
+            raise
+        finally:
+            # Even in case of success the value on tha camera could
+            # slightly differ from the target one, as not all float
+            # value are allowed.
+            new_value = getattr(self.camera, feature)
+            setattr(self, key, new_value)
 
     serialNumber = String(
         displayedName="Serial Number",
@@ -219,21 +243,16 @@ class AndorSdk3Camera(CameraImageSource):
         allowedStates={State.UNKNOWN, State.ON})
     async def cycleMode(self, value):
         self.set_feature("cycleMode", value)
-        if value.value == "Fixed":
-            # 'frameCount' can only be set when in 'Fixed' cycle mode
-            self.set_feature("frameCount", self.frameCount)
 
     @UInt32(
         displayedName="Frame Count",
-        description="Number of frames to acquire when in 'Fixed' cycle mode.",
+        description="Number of frames to acquire when in 'Fixed' cycle mode. "
+                    "This parameter can only be set with continuous cycle "
+                    "mode.",
         minInc=1,
         allowedStates={State.UNKNOWN, State.ON})
     async def frameCount(self, value):
-        if self.cycleMode.value == "Fixed":
-            # Can only be set on the camera in "Fixed" cycle mode
-            self.set_feature("frameCount", value)
-        else:
-            self.frameCount = value
+        self.set_feature("frameCount", value)
 
     @Double(
         displayedName="Exposure Time",
@@ -245,6 +264,8 @@ class AndorSdk3Camera(CameraImageSource):
 
     @Double(
         displayedName="Target Frame Rate",
+        description="The target frame rate. This parameter can only be set "
+                    "in internal trigger mode.",
         minInc=0.0,
         unitSymbol=Unit.HERTZ,
         allowedStates={State.UNKNOWN, State.ON})
@@ -629,6 +650,7 @@ class AndorSdk3Camera(CameraImageSource):
         self.frame_rate_task = None
         self.acq_task = None
         self.connect_or_poll_task = None
+        self.schema_hash = None
         self.must_update_schema = False
 
     def connect(self):
@@ -737,12 +759,13 @@ class AndorSdk3Camera(CameraImageSource):
                     self.logger.debug(
                         f"Setting {feature} = {value.value}")
                     setattr(self.camera, feature, value.value)
-                except Exception as e:
+                except CameraException as e:
                     # Setting of this parameter could be not allowed in the
                     # current status of the camera
                     failed.append(key)
                     self.logger.warning(
-                        f"Could not set {key} on camera: {e}")
+                        f"Could not set {key} on camera: {e}. "
+                        "This could depend on other camera settings.")
 
             # Read back value from the camera
             value = getattr(self.camera, feature)
@@ -755,7 +778,8 @@ class AndorSdk3Camera(CameraImageSource):
         if failed:
             self.status = (
                 "The following parameters could not be set: " +
-                ", ".join(failed))
+                ", ".join(failed) + ". This could depend on other "
+                "camera settings.")
 
         self.camera.MetadataEnable = True
 
@@ -803,8 +827,21 @@ class AndorSdk3Camera(CameraImageSource):
         if not self.camera:
             return
 
+        try:
+            # This might fail in case 'inner' has been called concurrently
+            # and the updated schema has not been published yet.
+            schema_hash = self.getDeviceSchema().hash
+            self.schema_hash = schema_hash
+        except AttributeError as e:
+            # Use cached schema if available
+            if self.schema_hash:
+                schema_hash = self.schema_hash
+            else:
+                self.logger.debug(
+                    f"Could not update options for {key}: {e}")
+                return
+
         # Skip read-only and init-only parameters
-        schema_hash = self.getDeviceSchema().hash
         access_mode = schema_hash.getAttribute(key, "accessMode")
         if access_mode != AccessMode.RECONFIGURABLE.value:
             return
@@ -949,6 +986,7 @@ class AndorSdk3Camera(CameraImageSource):
         if self.must_update_schema:
             self.logger.debug("Injecting new schema")
             await self.publishInjectedParameters()
+            self.schema_hash = None
             self.must_update_schema = False
 
         if SCHEMA_CHANGING_PROPERTIES.intersection(conf):
