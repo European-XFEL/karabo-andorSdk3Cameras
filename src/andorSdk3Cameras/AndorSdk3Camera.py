@@ -978,6 +978,7 @@ class AndorSdk3Camera(CameraImageSource):
             if self.camera.CameraAcquiring:
                 self.camera.AcquisitionStop()
             self.camera.flush()  # cleans any existing queued buffers
+            self.camera = None  # needed to allow other clients to connect
 
     async def slotReconfigure(self, conf, message):
         self.logger.debug(f"slotReconfigure: conf = {conf}")
