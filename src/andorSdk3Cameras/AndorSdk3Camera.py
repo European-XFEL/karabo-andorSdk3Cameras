@@ -13,6 +13,7 @@
 #############################################################################
 
 from asyncio import CancelledError, wait_for
+from copy import copy
 from time import time
 
 import numpy as np
@@ -43,6 +44,7 @@ FEATURE_MAP = {
     "interfaceType": "InterfaceType",
     "firmwareVersion": "FirmwareVersion",
     "clockFrequency": "TimestampClockFrequency",
+    "timestampClock": "TimestampClock",
     "bitDepth": "BitDepth",
     "bytesPerPixel": "BytesPerPixel",
     "pixelHeight": "PixelHeight",
@@ -140,7 +142,6 @@ class Flip(Configurable):
 class AndorSdk3Camera(CameraImageSource):
     __version__ = deviceVersion
 
-    camera = None
     sdk3 = AndorSDK3()
 
     def register_callback(self, feature):
@@ -305,7 +306,7 @@ class AndorSdk3Camera(CameraImageSource):
         self.image_latency.window.clear()
 
         # Synchronize camera internal clock and Karabo time
-        self.synchronize_camera()
+        self.timestampClock = self.camera.TimestampClock
 
         img_size = self.camera.ImageSizeBytes
         buffer_count = 5
@@ -323,52 +324,6 @@ class AndorSdk3Camera(CameraImageSource):
             try:
                 img = self.camera.wait_buffer(timeout=1000)  # timeout in ms
                 image_count += 1
-
-                current_timestamp = get_timestamp()
-                current_tid = current_timestamp.tid
-                current_time = current_timestamp.toTimestamp()
-
-                data = img.image  # ndarray
-                camera_clock = img.metadata.timestamp  # "ticks" since power up
-
-                # Corrected image time
-                image_time = (
-                    (camera_clock - self.timestampClock.value) /
-                    self.clockFrequency.value + self.reference_time)
-                latency, _ = self.image_latency(current_time - image_time)
-                ts = Timestamp(image_time)
-                if None in (self.ts_tid, self.ts_timestamp, self.ts_period):
-                    # No reference info from timeserver. Use actual tid
-                    ts.tid = current_tid
-                else:
-                    delta_tid = int(
-                        (image_time - self.ts_timestamp) / self.ts_period)
-                    ts.tid = self.ts_tid + delta_tid
-
-                self.logger.debug(
-                    f"Received new image: shape: {data.shape} "
-                    f"current time: {current_time} current tid: {current_tid} "
-                    f"camera clock: {camera_clock} latency: {latency} "
-                    f"corrected tid: {ts.tid}")
-
-                # Flip and rotate image
-                data = flip_and_rotate(
-                    data, self.flip.x, self.flip.y, self.rotation.value)
-
-                await self.write_channels(
-                    data, encoding=Encoding.GRAY, timestamp=ts)
-
-                # Reuse buffer
-                self.camera.queue(img._np_data, img_size)
-
-                self.frame_rate.update()
-
-                if latency > self.maxLatency.value:
-                    self.state = State.ERROR
-                    self.status = (
-                        f"Too high latency: {latency} s. The frame rate is "
-                        "possibly too high.")
-                    break
 
             except CancelledError:
                 # Task has been canceled
@@ -394,21 +349,98 @@ class AndorSdk3Camera(CameraImageSource):
                     # e.g. waiting for external/software trigger
                     continue
                 else:
-                    self.status = f"Exception in acquire_task: {e}"
+                    self.status = f"CameraException in acquire_task: {e}"
                     self.state = State.ERROR
                     break
 
+            try:
+                current_timestamp = get_timestamp()
+                current_tid = current_timestamp.tid
+                current_time = current_timestamp.toTimestamp()
+                current_time_unix = time()
+
+                data = img.image  # ndarray
+                # Image time as "ticks" since camera power-up.
+                # Convert it to "float" to avoid overflows from int operations
+                image_time_ticks = float(img.metadata.timestamp)
+
+                # Camera clock (ticks): cache current value as it could be
+                # updated in the background by the polling task
+                timestamp_clock = copy(self.timestampClock)
+                timestamp_clock_ts = timestamp_clock.timestamp.toTimestamp()
+
+                # Corrected image time
+                image_time = (
+                    (image_time_ticks - timestamp_clock.value) /
+                    self.clockFrequency.value + timestamp_clock_ts)
+                if current_time < image_time:
+                    self.logger.warning(
+                        "This should not happen! latency < 0.0!!! "
+                        f"Current time: {current_time} s; "
+                        f"Current time (UNIX): {current_time_unix} s; "
+                        f"Image time: {image_time} s; "
+                        f"Image time: {image_time_ticks} ticks; "
+                        f"Cam ref. time: {timestamp_clock.value} ticks; "
+                        f"Clock freq. {self.clockFrequency.value} Hz; "
+                        f"Ref. time: {timestamp_clock_ts} s; "
+                        f"TS tid: {self.ts_tid}; "
+                        f"TS ts: {self.ts_timestamp} s; "
+                        f"TS perios: {self.ts_period} s,")
+                    continue  # drop image
+                latency, _ = self.image_latency(current_time - image_time)
+
+                ts = Timestamp(image_time)
+                if None in (self.ts_tid, self.ts_timestamp, self.ts_period):
+                    # No reference info from timeserver. Use actual tid
+                    ts.tid = current_tid
+                else:
+                    delta_tid = (
+                        image_time - self.ts_timestamp) / self.ts_period
+                    ts.tid = self.ts_tid + delta_tid
+
+                self.logger.debug(
+                    f"Received new image: shape: {data.shape} "
+                    f"current time: {current_time} current tid: {current_tid} "
+                    f"camera clock: {image_time_ticks} latency: {latency} "
+                    f"corrected tid: {ts.tid}")
+
+                # Flip and rotate image
+                data = flip_and_rotate(
+                    data, self.flip.x, self.flip.y, self.rotation.value)
+                await self.write_channels(
+                    data, encoding=Encoding.GRAY, timestamp=ts)
+
+                self.frame_rate.update()
+
+                if latency > self.maxLatency.value:
+                    self.state = State.ERROR
+                    msg = (
+                        f"Too high latency: {latency} s. The frame rate is "
+                        "possibly too high.")
+                    self.status = msg
+                    self.logger.error(msg)
+                    break
+
+            except CancelledError:
+                # Task has been canceled
+                break
+
             except Exception as e:
-                self.status = f"Exception in acquire_task: {e}"
+                msg = f"{e.__class__.__name__} in acquire_task: {e}."
+                self.status = msg
                 self.state = State.ERROR
                 break
 
             finally:
+                # Reuse buffer
+                self.camera.queue(img._np_data, img_size)
+
                 await sleep(0.01)
 
-        if self.camera.CameraAcquiring:
-            self.camera.AcquisitionStop()
-        self.camera.flush()  # cleans any existing queued buffers
+        if self.camera.handle:
+            if self.camera.CameraAcquiring:
+                self.camera.AcquisitionStop()
+            self.camera.flush()  # cleans any existing queued buffers
 
     @Slot(
         displayedName="Stop",
@@ -642,6 +674,9 @@ class AndorSdk3Camera(CameraImageSource):
 
     def __init__(self, configuration):
         super().__init__(configuration)
+
+        self.camera = None
+
         self.ts_tid = None
         self.ts_timestamp = None
         self.ts_period = None
@@ -894,20 +929,13 @@ class AndorSdk3Camera(CameraImageSource):
                 minInc=new_min, maxInc=new_max, defaultValue=default_value))
             self.must_update_schema = True
 
-    def synchronize_camera(self):
-        """Synchronizes the camera internal clock and the Karabo time"""
-        self.timestampClock = self.camera.TimestampClock
-        self.reference_time = time()
-
     async def poll_camera(self):
         error_count = 0
 
         while True:
             try:
-                # Synchronize camera internal clock and Karabo time
-                self.synchronize_camera()
-
-                for key in ("sensorTemperature", "temperatureStatus"):
+                for key in ("sensorTemperature", "temperatureStatus",
+                            "timestampClock"):
                     self.sync_feature(key)
 
                 error_count = 0
