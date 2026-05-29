@@ -305,17 +305,23 @@ class AndorSdk3Camera(CameraImageSource):
     async def acquire_task(self):
         self.image_latency.window.clear()
 
-        # Synchronize camera internal clock and Karabo time
-        self.timestampClock = self.camera.TimestampClock
+        try:
+            # Synchronize camera internal clock and Karabo time
+            self.timestampClock = self.camera.TimestampClock
 
-        img_size = self.camera.ImageSizeBytes
-        buffer_count = 5
-        for _ in range(0, buffer_count):
-            # Allocate buffers
-            buf = np.empty((img_size,), dtype='B')
-            self.camera.queue(buf, img_size)
+            img_size = self.camera.ImageSizeBytes
+            buffer_count = 5
+            for _ in range(0, buffer_count):
+                # Allocate buffers
+                buf = np.empty((img_size,), dtype='B')
+                self.camera.queue(buf, img_size)
 
-        self.camera.AcquisitionStart()
+            self.camera.AcquisitionStart()
+
+        except CameraException:
+            # The connection with the camera has been lost
+            await self.disconnection_handler()
+            return
 
         image_count = 0
         cycle_mode = self.camera.CycleMode
@@ -336,7 +342,7 @@ class AndorSdk3Camera(CameraImageSource):
                     camera_acquiring = self.camera.CameraAcquiring
                 except CameraException:
                     await self.disconnection_handler()
-                    break
+                    return
 
                 if not camera_acquiring:
                     self.state = State.ON
