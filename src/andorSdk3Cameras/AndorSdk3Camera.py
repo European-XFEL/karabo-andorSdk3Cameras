@@ -391,7 +391,7 @@ class AndorSdk3Camera(CameraImageSource):
                         f"Ref. time: {timestamp_clock_ts} s; "
                         f"TS tid: {self.ts_tid}; "
                         f"TS ts: {self.ts_timestamp} s; "
-                        f"TS perios: {self.ts_period} s,")
+                        f"TS period: {self.ts_period} s.")
                     continue  # drop image
                 latency, _ = self.image_latency(current_time - image_time)
 
@@ -437,13 +437,12 @@ class AndorSdk3Camera(CameraImageSource):
                 self.state = State.ERROR
                 break
 
-            finally:
-                # Reuse buffer
-                self.camera.queue(img._np_data, img_size)
+            # Reuse buffer
+            self.camera.queue(img._np_data, img_size)
 
-                await sleep(0.01)
+            await sleep(0.01)
 
-        if self.camera.handle:
+        if self.camera and self.camera.handle:
             if self.camera.CameraAcquiring:
                 self.camera.AcquisitionStop()
             self.camera.flush()  # cleans any existing queued buffers
